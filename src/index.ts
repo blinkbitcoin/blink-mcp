@@ -27,10 +27,14 @@ import {
   setSubscriptionCallback,
 } from "./tools/webhooks.js";
 import { l402Tools, handleL402Tool } from "./tools/l402.js";
+import { createRequire } from "node:module";
 
 // Server configuration
 const SERVER_NAME = "blink-mcp";
-const SERVER_VERSION = "1.0.0";
+const _require = createRequire(import.meta.url);
+const { version: SERVER_VERSION } = _require("../package.json") as {
+  version: string;
+};
 
 // Environment configuration
 interface ServerConfig {
