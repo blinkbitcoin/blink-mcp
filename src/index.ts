@@ -45,7 +45,9 @@ function getConfig(): ServerConfig {
     console.error("Error: BLINK_API_KEY environment variable is required");
     console.error("");
     console.error("To get an API key:");
-    console.error("1. Log in to your Blink wallet at https://wallet.blink.sv");
+    console.error(
+      "1. Log in to your Blink wallet at https://dashboard.blink.sv",
+    );
     console.error("2. Go to Settings > API Keys");
     console.error("3. Create a new API key with the desired permissions");
     console.error("");

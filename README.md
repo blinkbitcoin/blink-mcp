@@ -15,7 +15,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 ## Prerequisites
 
 - Node.js 18+
-- A Blink wallet account ([wallet.blink.sv](https://wallet.blink.sv))
+- A Blink wallet account ([dashboard.blink.sv](https://dashboard.blink.sv))
 - A Blink API key
 
 ## Installation
@@ -31,7 +31,7 @@ npm run build
 
 ### Getting an API Key
 
-1. Log in to your Blink wallet at [wallet.blink.sv](https://wallet.blink.sv)
+1. Log in to your Blink wallet at [dashboard.blink.sv](https://dashboard.blink.sv)
 2. Go to **Settings** > **API Keys**
 3. Click **Create API Key**
 4. Select the permissions you need:
