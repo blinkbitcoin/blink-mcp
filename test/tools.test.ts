@@ -103,8 +103,8 @@ describe("tool registry", () => {
 
   test("total tool count matches expected", () => {
     const count = Object.keys(allTools).length;
-    // 49 original tools + 3 L402 consumer tools = 52
-    assert.equal(count, 52, `Expected 52 tools, got ${count}`);
+    // 49 original + 3 L402 consumer + 3 L402 producer/search = 55
+    assert.equal(count, 55, `Expected 55 tools, got ${count}`);
   });
 });
 

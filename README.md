@@ -11,6 +11,9 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 - **Webhooks**: Register callbacks for payment notifications
 - **Real-time Subscriptions**: Monitor invoice status and account updates
 - **Price Data**: Get real-time and historical Bitcoin prices
+- **L402 Consumer**: Discover, pay for, and cache tokens for L402-gated APIs
+- **L402 Producer**: Create Lightning paywalls and verify payment tokens
+- **L402 Discovery**: Search l402.directory and 402index.io for paid APIs
 
 ## Prerequisites
 
@@ -169,6 +172,17 @@ BLINK_API_KEY=your_key node dist/index.js
 | `cancel_subscription`              | Cancel a subscription           |
 | `cancel_all_subscriptions`         | Cancel all subscriptions        |
 
+### L402 Protocol (6 tools)
+
+| Tool                     | Description                                                        |
+| ------------------------ | ------------------------------------------------------------------ |
+| `l402_discover`          | Probe a URL for L402 payment requirements (no payment)             |
+| `l402_pay`               | Access an L402-protected URL, paying automatically via Blink       |
+| `l402_store`             | Manage the L402 token cache (~/.blink/l402-tokens.json)            |
+| `l402_challenge_create`  | Create an L402 payment challenge (invoice + signed macaroon)       |
+| `l402_payment_verify`    | Verify an L402 payment token (preimage + HMAC signature + caveats) |
+| `l402_search`            | Search L402 service directories (l402.directory or 402index.io)    |
+
 ## Example Conversations
 
 ### Check Balance
@@ -237,7 +251,8 @@ src/
     ├── lightning.ts      # Lightning Network tools
     ├── onchain.ts        # On-chain Bitcoin tools
     ├── intraledger.ts    # Blink-to-Blink transfer tools
-    └── webhooks.ts       # Webhook and subscription tools
+    ├── webhooks.ts       # Webhook and subscription tools
+    └── l402.ts           # L402 consumer, producer, and discovery tools
 ```
 
 ## API Reference

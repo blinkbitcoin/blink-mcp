@@ -290,6 +290,202 @@ function derivePreimageFromInvoice(invoice: string): string {
   return crypto.createHash("sha256").update(invoice).digest("hex");
 }
 
+// ── Macaroon crypto (L402 Producer) ───────────────────────────────────────────
+// Port of blink-skills/blink/scripts/_l402_macaroon.js to TypeScript.
+// HMAC-SHA256 macaroons with TLV caveats — zero external crypto deps.
+
+const MACAROON_VERSION = 0x01;
+const CAVEAT_TYPE_EXPIRY = 0x01;
+const CAVEAT_TYPE_RESOURCE = 0x02;
+
+function hmacSha256(key: Buffer, data: Buffer): Buffer {
+  return crypto.createHmac("sha256", key).update(data).digest();
+}
+
+function encodeCaveats(
+  caveats: Array<{ type: number; value: Buffer }>,
+): Buffer {
+  const parts: Buffer[] = [];
+  for (const c of caveats) {
+    const len = Buffer.alloc(2);
+    len.writeUInt16BE(c.value.length);
+    parts.push(Buffer.from([c.type]), len, c.value);
+  }
+  return Buffer.concat(parts);
+}
+
+function decodeCaveats(
+  buf: Buffer,
+): Array<{ type: number; value: Buffer }> {
+  const caveats: Array<{ type: number; value: Buffer }> = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    const type = buf[offset];
+    const len = buf.readUInt16BE(offset + 1);
+    const value = buf.subarray(offset + 3, offset + 3 + len);
+    caveats.push({ type, value });
+    offset += 3 + len;
+  }
+  return caveats;
+}
+
+function encodeExpiryValue(ts: number): Buffer {
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(ts));
+  return buf;
+}
+
+function decodeExpiryValue(buf: Buffer): number {
+  return Number(buf.readBigUInt64BE(0));
+}
+
+function createMacaroon(opts: {
+  paymentHash: string;
+  rootKey: Buffer;
+  expirySeconds?: number | null;
+  resource?: string | null;
+}): string {
+  if (!/^[0-9a-fA-F]{64}$/.test(opts.paymentHash)) {
+    throw new Error("paymentHash must be a 64-character hex string");
+  }
+  if (!Buffer.isBuffer(opts.rootKey) || opts.rootKey.length !== 32) {
+    throw new Error("rootKey must be a 32-byte Buffer");
+  }
+
+  const paymentHashBuf = Buffer.from(opts.paymentHash, "hex");
+  const caveats: Array<{ type: number; value: Buffer }> = [];
+  if (opts.expirySeconds != null) {
+    caveats.push({
+      type: CAVEAT_TYPE_EXPIRY,
+      value: encodeExpiryValue(opts.expirySeconds),
+    });
+  }
+  if (opts.resource) {
+    caveats.push({
+      type: CAVEAT_TYPE_RESOURCE,
+      value: Buffer.from(opts.resource, "utf8"),
+    });
+  }
+
+  const caveatsBuf = encodeCaveats(caveats);
+  const body = Buffer.concat([
+    Buffer.from([MACAROON_VERSION]),
+    paymentHashBuf,
+    caveatsBuf,
+  ]);
+  const sig = hmacSha256(opts.rootKey, body);
+  return Buffer.concat([body, sig]).toString("base64url");
+}
+
+function decodeMacaroon(opts: {
+  macaroon: string;
+  rootKey: Buffer;
+}): {
+  signatureValid: boolean;
+  paymentHash: string;
+  expiresAt: number | null;
+  resource: string | null;
+} {
+  const raw = Buffer.from(opts.macaroon, "base64url");
+  if (raw.length < 1 + 32 + 32) {
+    throw new Error("Macaroon too short to be valid.");
+  }
+  const version = raw[0];
+  if (version !== MACAROON_VERSION) {
+    throw new Error(`Unsupported macaroon version: ${version}`);
+  }
+
+  const paymentHash = raw.subarray(1, 33).toString("hex");
+  const body = raw.subarray(0, raw.length - 32);
+  const embeddedSig = raw.subarray(raw.length - 32);
+  const expectedSig = hmacSha256(opts.rootKey, body);
+  const signatureValid = crypto.timingSafeEqual(embeddedSig, expectedSig);
+
+  const caveatsBuf = raw.subarray(33, raw.length - 32);
+  const caveats = decodeCaveats(caveatsBuf);
+
+  let expiresAt: number | null = null;
+  let resource: string | null = null;
+  for (const c of caveats) {
+    if (c.type === CAVEAT_TYPE_EXPIRY) expiresAt = decodeExpiryValue(c.value);
+    if (c.type === CAVEAT_TYPE_RESOURCE) resource = c.value.toString("utf8");
+  }
+
+  return { signatureValid, paymentHash, expiresAt, resource };
+}
+
+function verifyPreimage(preimage: string, paymentHash: string): boolean {
+  if (!/^[0-9a-fA-F]{64}$/.test(preimage)) return false;
+  if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) return false;
+  const hash = crypto
+    .createHash("sha256")
+    .update(Buffer.from(preimage, "hex"))
+    .digest("hex");
+  return hash.toLowerCase() === paymentHash.toLowerCase();
+}
+
+function checkCaveats(opts: {
+  expiresAt: number | null;
+  resource: string | null;
+  checkResource?: string | null;
+  nowSeconds?: number;
+}): { expired: boolean; resourceMismatch: boolean; caveatsValid: boolean } {
+  const now = opts.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const expired = opts.expiresAt !== null && now > opts.expiresAt;
+  const resourceMismatch =
+    opts.checkResource != null &&
+    opts.resource !== null &&
+    opts.resource !== opts.checkResource;
+  return {
+    expired,
+    resourceMismatch,
+    caveatsValid: !expired && !resourceMismatch,
+  };
+}
+
+// ── Root key management ──────────────────────────────────────────────────────
+
+const ROOT_KEY_FILE = path.join(os.homedir(), ".blink", "l402-root-key");
+
+function getRootKey(): Buffer {
+  // 1. Environment variable
+  const envKey = process.env.BLINK_L402_ROOT_KEY;
+  if (envKey) {
+    if (!/^[0-9a-fA-F]{64}$/.test(envKey)) {
+      throw new Error(
+        "BLINK_L402_ROOT_KEY must be a 64-character hex string (32 bytes).",
+      );
+    }
+    return Buffer.from(envKey, "hex");
+  }
+
+  // 2. File
+  try {
+    const hex = fs.readFileSync(ROOT_KEY_FILE, "utf8").trim();
+    if (/^[0-9a-fA-F]{64}$/.test(hex)) {
+      return Buffer.from(hex, "hex");
+    }
+  } catch {
+    // File doesn't exist — generate
+  }
+
+  // 3. Auto-generate
+  const newKey = crypto.randomBytes(32);
+  const dir = path.dirname(ROOT_KEY_FILE);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(ROOT_KEY_FILE, newKey.toString("hex"), "utf8");
+  fs.chmodSync(ROOT_KEY_FILE, 0o600);
+  console.error(
+    `Generated new L402 root key at ${ROOT_KEY_FILE}. Keep this file stable.`,
+  );
+  return newKey;
+}
+
+// ── Service discovery URLs ───────────────────────────────────────────────────
+
+const DIRECTORY_URL = "https://l402.directory/api/services";
+const INDEX_URL = "https://402index.io/api/v1/services";
+
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
 export const l402Tools = {
@@ -337,6 +533,95 @@ export const l402Tools = {
         .enum(["GET", "POST"])
         .default("GET")
         .describe("HTTP method for the resource request"),
+    }),
+  },
+
+  l402_challenge_create: {
+    description:
+      "Create an L402 payment challenge (invoice + signed macaroon) to protect " +
+      "a resource behind a Lightning paywall. Returns a WWW-Authenticate header " +
+      "that can be sent to clients with HTTP 402.",
+    inputSchema: z.object({
+      amount_sats: z
+        .number()
+        .int()
+        .positive()
+        .describe("Invoice amount in satoshis"),
+      wallet_id: z
+        .string()
+        .optional()
+        .describe("Blink BTC wallet ID (auto-resolved if omitted)"),
+      memo: z.string().optional().describe("Invoice memo / description"),
+      expiry_seconds: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Macaroon expiry in seconds from now (e.g. 3600 = 1 hour)",
+        ),
+      resource: z
+        .string()
+        .optional()
+        .describe(
+          "Resource identifier caveat (e.g. /api/v1/data). Token will only be valid for this path.",
+        ),
+    }),
+  },
+
+  l402_payment_verify: {
+    description:
+      "Verify an L402 payment token submitted by a client. Checks three layers: " +
+      "1) preimage proves payment (SHA-256), 2) HMAC signature proves authenticity, " +
+      "3) caveats (expiry, resource) are satisfied. Returns valid: true/false.",
+    inputSchema: z.object({
+      token: z
+        .string()
+        .optional()
+        .describe(
+          "L402 token in <macaroon>:<preimage> format (colon-separated)",
+        ),
+      macaroon: z
+        .string()
+        .optional()
+        .describe("base64url-encoded macaroon (alternative to token)"),
+      preimage: z
+        .string()
+        .optional()
+        .describe("64-char hex preimage (alternative to token)"),
+      resource: z
+        .string()
+        .optional()
+        .describe(
+          "Expected resource identifier to check against the macaroon caveat",
+        ),
+    }),
+  },
+
+  l402_search: {
+    description:
+      "Search L402 service directories to find paid APIs that can be accessed " +
+      "with Lightning payments. Default source: l402.directory (curated, rich schema). " +
+      "Alternative: 402index.io (broader coverage, 50+ services).",
+    inputSchema: z.object({
+      query: z
+        .string()
+        .optional()
+        .describe("Keyword to search across names and descriptions"),
+      source: z
+        .enum(["directory", "402index"])
+        .default("directory")
+        .describe(
+          '"directory" (l402.directory, default) or "402index" (402index.io)',
+        ),
+      category: z
+        .string()
+        .optional()
+        .describe("Filter by category (e.g. video, data, ai)"),
+      status: z
+        .enum(["live", "all"])
+        .default("live")
+        .describe('"live" (default) or "all" (include offline)'),
     }),
   },
 
@@ -719,6 +1004,253 @@ export async function handleL402Tool(
         tokenReused: false,
         retryStatus: retryRes.status,
         data: retryData,
+      };
+    }
+
+    case "l402_challenge_create": {
+      const { amount_sats, wallet_id, memo, expiry_seconds, resource } =
+        args as {
+          amount_sats: number;
+          wallet_id?: string;
+          memo?: string;
+          expiry_seconds?: number;
+          resource?: string;
+        };
+
+      // Resolve wallet ID
+      let walletId = wallet_id;
+      if (!walletId) {
+        const walletsResult = await client.getWallets();
+        const wallets = walletsResult.me.defaultAccount.wallets as Array<{
+          id: string;
+          walletCurrency: string;
+        }>;
+        const btcWallet = wallets.find((w) => w.walletCurrency === "BTC");
+        if (!btcWallet) {
+          return { success: false, error: "No BTC wallet found on this account." };
+        }
+        walletId = btcWallet.id;
+      }
+
+      // Create invoice
+      const invoiceResult = await client.createLnInvoice({
+        walletId,
+        amount: amount_sats,
+        memo: memo || `L402 challenge: ${amount_sats} sats`,
+      });
+
+      const inv = invoiceResult.lnInvoiceCreate;
+      if (inv.errors && (inv.errors as unknown[]).length > 0) {
+        return {
+          success: false,
+          error: `Invoice creation failed: ${JSON.stringify(inv.errors)}`,
+        };
+      }
+
+      const invoice = inv.invoice as {
+        paymentRequest: string;
+        paymentHash: string;
+        satoshis: number;
+      };
+
+      // Compute expiry timestamp
+      const expiryTs = expiry_seconds
+        ? Math.floor(Date.now() / 1000) + expiry_seconds
+        : null;
+
+      // Create signed macaroon
+      const rootKey = getRootKey();
+      const macaroon = createMacaroon({
+        paymentHash: invoice.paymentHash,
+        rootKey,
+        expirySeconds: expiryTs,
+        resource: resource || null,
+      });
+
+      // Build WWW-Authenticate header
+      const header = `L402 macaroon="${macaroon}", invoice="${invoice.paymentRequest}"`;
+
+      return {
+        success: true,
+        header,
+        macaroon,
+        invoice: invoice.paymentRequest,
+        paymentHash: invoice.paymentHash,
+        satoshis: invoice.satoshis,
+        expiresAt: expiryTs,
+        resource: resource || null,
+      };
+    }
+
+    case "l402_payment_verify": {
+      const { token, macaroon: macArg, preimage: preArg, resource } =
+        args as {
+          token?: string;
+          macaroon?: string;
+          preimage?: string;
+          resource?: string;
+        };
+
+      // Resolve macaroon and preimage
+      let mac = macArg || null;
+      let pre = preArg || null;
+      if (token) {
+        const colonIdx = token.indexOf(":");
+        if (colonIdx === -1) {
+          return {
+            success: false,
+            error:
+              "token must be in <macaroon>:<preimage> format (colon-separated).",
+          };
+        }
+        mac = token.slice(0, colonIdx);
+        pre = token.slice(colonIdx + 1);
+      }
+
+      if (!mac) {
+        return {
+          success: false,
+          error: "Provide token or both macaroon and preimage.",
+        };
+      }
+      if (!pre) {
+        return { success: false, error: "preimage is required." };
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(pre)) {
+        return {
+          success: false,
+          error: `preimage must be a 64-character hex string (got ${pre.length} characters).`,
+        };
+      }
+
+      // Decode and verify macaroon
+      const rootKey = getRootKey();
+      let decoded;
+      try {
+        decoded = decodeMacaroon({ macaroon: mac, rootKey });
+      } catch (e) {
+        return {
+          valid: false,
+          preimageValid: false,
+          signatureValid: false,
+          caveatsValid: false,
+          paymentHash: null,
+          resource: null,
+          expiresAt: null,
+          expired: false,
+          error: (e as Error).message,
+        };
+      }
+
+      const preimageValid = verifyPreimage(pre, decoded.paymentHash);
+      const caveatResult = checkCaveats({
+        expiresAt: decoded.expiresAt,
+        resource: decoded.resource,
+        checkResource: resource || null,
+      });
+
+      const valid =
+        preimageValid && decoded.signatureValid && caveatResult.caveatsValid;
+
+      return {
+        valid,
+        preimageValid,
+        signatureValid: decoded.signatureValid,
+        caveatsValid: caveatResult.caveatsValid,
+        paymentHash: decoded.paymentHash,
+        resource: decoded.resource,
+        expiresAt: decoded.expiresAt,
+        expired: caveatResult.expired,
+        ...(caveatResult.resourceMismatch ? { resourceMismatch: true } : {}),
+      };
+    }
+
+    case "l402_search": {
+      const { query, source, category, status } = args as {
+        query?: string;
+        source: string;
+        category?: string;
+        status: string;
+      };
+
+      if (source === "402index") {
+        // 402index.io
+        const params = new URLSearchParams();
+        params.set("protocol", "l402");
+        if (status !== "all") params.set("health", "healthy");
+        if (category) params.set("category", category);
+
+        const res = await fetch(`${INDEX_URL}?${params}`, {
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) {
+          return {
+            success: false,
+            error: `402index.io returned HTTP ${res.status}`,
+          };
+        }
+        const data = (await res.json()) as { services: Array<Record<string, unknown>> };
+        let services = data.services || [];
+
+        // Client-side keyword filter
+        if (query) {
+          const q = query.toLowerCase();
+          services = services.filter(
+            (s) =>
+              (typeof s.name === "string" && s.name.toLowerCase().includes(q)) ||
+              (typeof s.description === "string" && s.description.toLowerCase().includes(q)) ||
+              (typeof s.category === "string" && s.category.toLowerCase().includes(q)),
+          );
+        }
+
+        const normalized = services.map((s) => ({
+          id: s.id,
+          name: s.name,
+          description: s.description,
+          url: s.url,
+          priceSats: s.price_sats,
+          category: s.category,
+          provider: s.provider,
+          status: s.health_status,
+          uptime30d: s.uptime_30d,
+          latencyP50ms: s.latency_p50_ms,
+          reliabilityScore: s.reliability_score,
+        }));
+
+        return {
+          source: "402index.io",
+          query: query || null,
+          category: category || null,
+          count: normalized.length,
+          services: normalized,
+        };
+      }
+
+      // l402.directory (default)
+      const params = new URLSearchParams();
+      if (query) params.set("q", query);
+      if (category) params.set("category", category);
+      if (status === "all") params.set("status", "all");
+
+      const res = await fetch(`${DIRECTORY_URL}?${params}`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        return {
+          success: false,
+          error: `l402.directory returned HTTP ${res.status}`,
+        };
+      }
+      const data = (await res.json()) as { services: unknown[] };
+
+      return {
+        source: "l402.directory",
+        query: query || null,
+        category: category || null,
+        count: (data.services || []).length,
+        services: data.services || [],
       };
     }
 
