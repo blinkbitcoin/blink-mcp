@@ -27,6 +27,16 @@ import {
   setSubscriptionCallback,
 } from "./tools/webhooks.js";
 import { l402Tools, handleL402Tool } from "./tools/l402.js";
+import { loadSecurityConfig } from "./security/config.js";
+import {
+  isSpendTool,
+  extractSpendIntent,
+  evaluateSpend,
+  confirmSpend,
+  DailyBudgetTracker,
+  ConfirmTokenStore,
+  type GuardContext,
+} from "./security/guard.js";
 import { createRequire } from "node:module";
 
 // Server configuration
@@ -229,6 +239,14 @@ async function main() {
     },
   );
 
+  // Security guard state (Phase 1/2 remediation).
+  const securityConfig = loadSecurityConfig();
+  const guardCtx: GuardContext = {
+    config: securityConfig,
+    budget: new DailyBudgetTracker(),
+  };
+  const confirmTokens = new ConfirmTokenStore();
+
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools = Object.entries(allTools).map(([name, def]) => ({
@@ -255,10 +273,113 @@ async function main() {
       }
 
       // Validate input with Zod
-      const validatedArgs = toolDef.inputSchema.parse(toolArgs);
+      const validatedArgs = toolDef.inputSchema.parse(toolArgs) as Record<
+        string,
+        unknown
+      >;
+
+      // ── Spend guard (Phase 1/2 remediation) ──────────────────────────────
+      // Every money-moving tool passes allowlist + caps + budget + confirmation
+      // before it can execute. Fails closed.
+      let spentThisCall: number | null = null;
+      if (isSpendTool(name)) {
+        const intent = extractSpendIntent(name, validatedArgs);
+        const decision = evaluateSpend(guardCtx, name, intent);
+
+        if (decision.action === "deny") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ success: false, error: decision.reason }),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        if (decision.action === "confirm") {
+          // confirm_token travels alongside the validated args (Zod strips
+          // unknown keys, so read it from the raw request).
+          const confirmArgs = {
+            ...validatedArgs,
+            confirm_token: (toolArgs as Record<string, unknown>).confirm_token,
+          };
+
+          // Use inline elicitation when the client supports it; otherwise the
+          // guard falls back to the two-step confirm-token flow.
+          const caps = server.getClientCapabilities();
+          const supportsElicitation = Boolean(caps?.elicitation);
+          const elicit = supportsElicitation
+            ? async (summary: string): Promise<boolean> => {
+                const res = await server.elicitInput({
+                  message: `Approve this payment?\n\n${summary}\n\nThis moves real funds and cannot be undone.`,
+                  requestedSchema: {
+                    type: "object",
+                    properties: {
+                      approve: {
+                        type: "boolean",
+                        description: "Set true to authorize this payment.",
+                      },
+                    },
+                    required: ["approve"],
+                  },
+                });
+                return res.action === "accept" && res.content?.approve === true;
+              }
+            : null;
+
+          const confirmation = await confirmSpend(
+            elicit,
+            confirmTokens,
+            name,
+            confirmArgs,
+            decision.summary,
+          );
+
+          if (confirmation.status === "rejected") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    success: false,
+                    error: confirmation.reason,
+                  }),
+                },
+              ],
+              isError: true,
+            };
+          }
+
+          if (confirmation.status === "pending") {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(confirmation.payload, null, 2),
+                },
+              ],
+            };
+          }
+          // approved → fall through to execution
+        }
+
+        // Track known amounts against the rolling 24h budget on success.
+        if (intent.amount !== null && !intent.isSweep) {
+          spentThisCall = intent.amount;
+        }
+      }
 
       // Execute the tool
       const result = await handleToolCall(blinkClient, name, validatedArgs);
+
+      // Record spend against the budget only after the call returns without
+      // throwing. (Tool-level {success:false} responses still count as an
+      // attempt is conservative; we only record on non-error return.)
+      if (spentThisCall !== null) {
+        guardCtx.budget.record(spentThisCall);
+      }
 
       return {
         content: [

@@ -271,6 +271,48 @@ This MCP server wraps the [Blink GraphQL API](https://dev.blink.sv/). For detail
 - **Write Operations**: Be cautious with write permissions as they allow sending funds
 - **Environment Variables**: Store API keys in environment variables, not in config files
 
+### Spend Guard
+
+Because this server holds a Blink API key and exposes tools that move funds, an
+agent processing untrusted content (a web page, email, invoice memo, etc.) could
+be steered into making a payment via indirect prompt injection. To mitigate
+this, every money-moving tool passes through a central **spend guard** before it
+executes, enforcing (in order): recipient allowlist → per-transaction cap →
+rolling 24h budget → **human confirmation**.
+
+The guard is **safe-by-default**: with no configuration, all spend tools require
+explicit confirmation before running.
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| `BLINK_REQUIRE_CONFIRMATION` | `true` | Require confirmation before any spend |
+| `BLINK_MAX_PAYMENT_SATS` | _(none)_ | Per-transaction cap in sats |
+| `BLINK_DAILY_BUDGET_SATS` | _(none)_ | Rolling 24h spend cap in sats |
+| `BLINK_RECIPIENT_ALLOWLIST` | _(none)_ | Allowed recipients (ln addr / username / btc addr / wallet id) |
+| `BLINK_WEBHOOK_ALLOWLIST` | _(none)_ | Allowed webhook callback hostnames |
+| `BLINK_L402_MAX_SATS` | `1000` | Mandatory default cap for `l402_pay` |
+| `BLINK_L402_HOST_ALLOWLIST` | _(none)_ | Allowed hostnames for L402 fetches |
+
+**Confirmation flow.** When the MCP client supports
+[elicitation](https://modelcontextprotocol.io/), the guard prompts inline and
+blocks until the user accepts. For clients without elicitation support, it uses
+a **two-step confirm-token** flow: the first tool call returns
+`requires_confirmation` with a single-use, 5-minute `confirm_token`; the model
+must re-invoke the tool with identical arguments plus that token to proceed.
+
+**Sweeps and unknown amounts.** `send_onchain_all` (full-balance sweep) and any
+payment whose amount is not known up front always require confirmation and are
+never auto-approved by budget checks alone.
+
+**L402 hardening.** `l402_pay` enforces a mandatory spend cap
+(`max_amount_sats` or `BLINK_L402_MAX_SATS`), refuses invoices whose amount
+cannot be decoded, and blocks non-HTTPS or private/loopback/link-local URLs
+(SSRF protection). Cached L402 tokens are stored `0600`, and
+`l402_store get` masks payment secrets unless called with `reveal: true`.
+
+**Webhooks.** `add_webhook` requires an HTTPS URL and, when
+`BLINK_WEBHOOK_ALLOWLIST` is set, a listed hostname.
+
 ## Troubleshooting
 
 ### "BLINK_API_KEY environment variable is required"

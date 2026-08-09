@@ -2,6 +2,8 @@
 
 import { z } from 'zod';
 import type { BlinkClient } from '../client.js';
+import { loadSecurityConfig } from '../security/config.js';
+import { checkWebhookUrl } from '../security/guard.js';
 
 // Store for active subscriptions (in-memory)
 const activeSubscriptions = new Map<string, {
@@ -107,6 +109,19 @@ export async function handleWebhookTool(
 
     case 'add_webhook': {
       const { url } = args as { url: string };
+
+      // Registering a callback endpoint sends account payment metadata to that
+      // URL indefinitely. Enforce HTTPS + optional domain allowlist so injected
+      // instructions cannot point it at an attacker endpoint.
+      const security = loadSecurityConfig();
+      const check = checkWebhookUrl(url, security.webhookAllowlist);
+      if (!check.ok) {
+        return {
+          success: false,
+          error: check.reason,
+        };
+      }
+
       const result = await client.addCallbackEndpoint(url);
       const response = result.callbackEndpointAdd;
       if (response.errors?.length > 0) {
