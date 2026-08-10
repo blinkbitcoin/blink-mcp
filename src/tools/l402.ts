@@ -15,6 +15,10 @@ import type { BlinkClient } from "../client.js";
 import { assertSafeUrl, SsrfError } from "../security/ssrf.js";
 import { loadSecurityConfig } from "../security/config.js";
 import { enforceAmount, type GuardContext } from "../security/guard.js";
+import { decodeBolt11AmountSats } from "../bolt11.js";
+
+// Re-exported for backwards compatibility (tests and callers import it here).
+export { decodeBolt11AmountSats };
 
 // ── Token store ───────────────────────────────────────────────────────────────
 
@@ -148,37 +152,6 @@ export function parseL402ProtocolBody(body: unknown): {
   };
 }
 
-export function decodeBolt11AmountSats(invoice: string): number | null {
-  if (!invoice) return null;
-  const lower = invoice.toLowerCase();
-  let amountStr: string;
-  if (lower.startsWith("lntbs")) amountStr = lower.slice(5);
-  else if (lower.startsWith("lntb")) amountStr = lower.slice(4);
-  else if (lower.startsWith("lnbc")) amountStr = lower.slice(4);
-  else return null;
-
-  const match = amountStr.match(/^(\d+)([munp]?)1/);
-  if (!match) return null;
-  const amount = parseInt(match[1], 10);
-  const multiplier = match[2];
-  if (isNaN(amount)) return null;
-
-  const BTC_TO_SAT = 100_000_000;
-  switch (multiplier) {
-    case "":
-      return amount * BTC_TO_SAT;
-    case "m":
-      return Math.round(amount * BTC_TO_SAT * 0.001);
-    case "u":
-      return Math.round(amount * BTC_TO_SAT * 0.000_001);
-    case "n":
-      return Math.round(amount * BTC_TO_SAT * 0.000_000_001);
-    case "p":
-      return Math.round(amount * BTC_TO_SAT * 0.000_000_000_001);
-    default:
-      return null;
-  }
-}
 
 async function fetchWithTimeout(
   url: string,

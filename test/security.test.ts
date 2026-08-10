@@ -95,6 +95,26 @@ describe("spend classification", () => {
     assert.equal(i.amount, null);
     assert.equal(i.recipient, "https://x");
   });
+
+  test("pay_invoice decodes the fixed amount from the bolt11", () => {
+    // lnbc10u... = 10 micro-BTC = 1000 sats.
+    const i = extractSpendIntent("pay_invoice", {
+      wallet_id: "w",
+      payment_request: "lnbc10u1pexampledata",
+    });
+    assert.equal(i.amount, 1000);
+    assert.equal(i.isSweep, false);
+    assert.equal(i.undecodable, false);
+  });
+
+  test("pay_invoice flags undecodable/amountless invoices", () => {
+    const i = extractSpendIntent("pay_invoice", {
+      wallet_id: "w",
+      payment_request: "not-a-bolt11",
+    });
+    assert.equal(i.amount, null);
+    assert.equal(i.undecodable, true);
+  });
 });
 
 // ── enforceAmount (shared authoritative amount gate) ───────────────────────
@@ -169,6 +189,67 @@ describe("evaluateSpend", () => {
       isSweep: false,
     });
     assert.equal(d.action, "deny");
+  });
+
+  test("pay_invoice: decoded amount over cap => deny (even with confirmation)", () => {
+    const c = ctx({ maxPaymentSats: 500 });
+    const d = evaluateSpend(c, "pay_invoice", {
+      amount: 900,
+      recipient: "lnbc9u1p...",
+      isSweep: false,
+    });
+    assert.equal(d.action, "deny");
+  });
+
+  test("pay_invoice: decoded amount within cap => confirm", () => {
+    const c = ctx({ maxPaymentSats: 5000 });
+    const d = evaluateSpend(c, "pay_invoice", {
+      amount: 1000,
+      recipient: "lnbc10u1p...",
+      isSweep: false,
+    });
+    assert.equal(d.action, "confirm");
+  });
+
+  test("pay_invoice: undecodable amount + cap => deny (never bypass)", () => {
+    const c = ctx({ maxPaymentSats: 500 });
+    const d = evaluateSpend(c, "pay_invoice", {
+      amount: null,
+      recipient: "bad-invoice",
+      isSweep: false,
+      undecodable: true,
+    });
+    assert.equal(d.action, "deny");
+  });
+
+  test("send_onchain_all sweep + cap => deny (cannot verify)", () => {
+    const c = ctx({ maxPaymentSats: 100000 });
+    const d = evaluateSpend(c, "send_onchain_all", {
+      amount: null,
+      recipient: "bc1q",
+      isSweep: true,
+    });
+    assert.equal(d.action, "deny");
+  });
+
+  test("send_onchain_all sweep + daily budget => deny", () => {
+    const c = ctx({ dailyBudgetSats: 100000 });
+    const d = evaluateSpend(c, "send_onchain_all", {
+      amount: null,
+      recipient: "bc1q",
+      isSweep: true,
+    });
+    assert.equal(d.action, "deny");
+  });
+
+  test("send_onchain_all sweep + NO caps => confirm (unchanged)", () => {
+    const c = ctx({});
+    const d = evaluateSpend(c, "send_onchain_all", {
+      amount: null,
+      recipient: "bc1q",
+      isSweep: true,
+    });
+    assert.equal(d.action, "confirm");
   });
 
   test("allows when confirmation disabled and within caps", () => {

@@ -17,6 +17,7 @@
 import crypto from "node:crypto";
 import type { SecurityConfig } from "./config.js";
 import type { SpendLedger } from "./ledger.js";
+import { decodeBolt11AmountSats } from "../bolt11.js";
 
 // ── Spend tool classification ──────────────────────────────────────────────
 
@@ -50,6 +51,13 @@ export interface SpendIntent {
   recipient: string | null;
   /** True when the tool sweeps the whole balance (unbounded amount). */
   isSweep: boolean;
+  /**
+   * True when the amount SHOULD be knowable up front but could not be derived
+   * (e.g. an undecodable / amountless bolt11 passed to pay_invoice). Signals
+   * evaluateSpend to refuse rather than pay past an unenforceable cap. Distinct
+   * from tools whose amount is legitimately discovered mid-call (l402_pay).
+   */
+  undecodable?: boolean;
 }
 
 /**
@@ -67,9 +75,22 @@ export function extractSpendIntent(
     typeof v === "string" && v.length > 0 ? v : null;
 
   switch (toolName) {
-    case "pay_invoice":
-      // Amount is embedded in the bolt11; not known without decoding.
-      return { amount: null, recipient: str(args.payment_request), isSweep: false };
+    case "pay_invoice": {
+      // Amount is embedded in the bolt11 and IS knowable up front, so decode it
+      // and subject it to the same caps/budget as any other spend. If decoding
+      // fails (amountless/open invoice, unknown prefix), flag it undecodable so
+      // the guard refuses rather than bypassing a configured cap.
+      const paymentRequest = str(args.payment_request);
+      const decoded = paymentRequest
+        ? decodeBolt11AmountSats(paymentRequest)
+        : null;
+      return {
+        amount: decoded,
+        recipient: paymentRequest,
+        isSweep: false,
+        undecodable: decoded === null,
+      };
+    }
     case "pay_invoice_with_amount":
       return { amount: num(args.amount), recipient: str(args.payment_request), isSweep: false };
     case "pay_lightning_address":
@@ -241,17 +262,39 @@ export function evaluateSpend(
     }
   }
 
-  // 2 & 3. Cap and budget checks when the amount is known up front. For tools
-  // whose amount is unknown here (l402_pay), these are re-run post-decode via
-  // enforceAmount() before payment — never skipped.
+  // 2 & 3. Cap and budget checks.
+  const capsConfigured =
+    config.maxPaymentSats !== null || config.dailyBudgetSats !== null;
+
   if (intent.amount !== null) {
+    // Amount known up front → enforce the cap/budget now.
     const amountCheck = enforceAmount(ctx, intent.amount);
     if (!amountCheck.ok) {
       return { action: "deny", reason: amountCheck.reason };
     }
-  } else if (config.maxPaymentSats !== null || config.dailyBudgetSats !== null) {
-    // Unknown amount + a configured cap: cannot verify here. Require
-    // confirmation so a human is in the loop; the amount gate still runs later.
+  } else if (capsConfigured) {
+    // Amount is null with a cap configured. There are three cases:
+    if (intent.undecodable) {
+      // Should have been knowable (e.g. undecodable bolt11) but wasn't. We
+      // cannot enforce the cap, so refuse rather than pay past it.
+      return {
+        action: "deny",
+        reason:
+          "A spend cap is configured but this invoice's amount could not be decoded. Refusing rather than bypassing the cap.",
+      };
+    }
+    if (intent.isSweep) {
+      // Full-balance sweep: amount is the entire wallet balance, which cannot
+      // be verified against a per-tx cap or budget. Refuse when caps are set.
+      return {
+        action: "deny",
+        reason:
+          "A spend cap is configured, but a full-balance sweep cannot be verified against it. Refusing.",
+      };
+    }
+    // Amount is legitimately discovered mid-call (l402_pay). enforceAmount() is
+    // re-run post-decode inside the handler; require confirmation here so a
+    // human is in the loop, and refuse if confirmation is disabled.
     if (!config.requireConfirmation) {
       return {
         action: "deny",

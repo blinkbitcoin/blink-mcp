@@ -310,15 +310,19 @@ fallback:
   context, so injection alone cannot obtain it.
 
 **Amount enforcement.** `BLINK_MAX_PAYMENT_SATS` and `BLINK_DAILY_BUDGET_SATS`
-are enforced for every spend tool. For `l402_pay`, whose amount is only known
+are enforced for every spend tool. Fixed-amount Lightning invoices are decoded
+from the bolt11 before payment so `pay_invoice` is subject to the same caps and
+budget as amount-carrying tools. For `l402_pay`, whose amount is only known
 after fetching the invoice, the caps are re-checked *after decoding* and before
-payment; the 24h budget is debited only on a **successful** payment (failed
-attempts never burn budget). The budget is persisted to a `0600` ledger at
+payment. The 24h budget is debited only on a **successful** payment (failed
+attempts never burn budget) and is persisted to a `0600` ledger at
 `~/.blink/spend-ledger.json` so it survives restarts.
 
-**Sweeps and unknown amounts.** `send_onchain_all` (full-balance sweep) and any
-payment whose amount is not known up front always require confirmation and are
-never auto-approved by budget checks alone.
+**Sweeps and undecodable amounts.** When a per-transaction cap or daily budget
+is configured, `send_onchain_all` (full-balance sweep) and any `pay_invoice`
+whose bolt11 amount cannot be decoded are **refused** — the amount cannot be
+verified against the cap, so the guard fails closed rather than bypassing it.
+With no caps configured, these still require confirmation.
 
 **L402 hardening.** `l402_pay` enforces a mandatory spend cap
 (`max_amount_sats` or `BLINK_L402_MAX_SATS`) plus the global caps above, and
