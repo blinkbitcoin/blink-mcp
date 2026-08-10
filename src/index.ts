@@ -33,10 +33,10 @@ import {
   extractSpendIntent,
   evaluateSpend,
   confirmSpend,
-  DailyBudgetTracker,
-  ConfirmTokenStore,
+  ApprovalCodeStore,
   type GuardContext,
 } from "./security/guard.js";
+import { SpendLedger } from "./security/ledger.js";
 import { createRequire } from "node:module";
 
 // Server configuration
@@ -178,11 +178,23 @@ function zodFieldToJsonSchema(schema: z.ZodType): Record<string, unknown> {
   return { type: "string" };
 }
 
+// A spend handler result counts as successful when it returns { success: true }.
+// Used to decide whether to debit the durable 24h budget (Fix 6: never debit on
+// a failed/rejected payment).
+function isSuccessfulSpend(result: unknown): boolean {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    (result as { success?: unknown }).success === true
+  );
+}
+
 // Route tool calls to appropriate handler
 async function handleToolCall(
   client: BlinkClient,
   toolName: string,
   args: Record<string, unknown>,
+  guard: GuardContext,
 ): Promise<unknown> {
   // Check which module the tool belongs to
   if (toolName in walletTools) {
@@ -201,7 +213,9 @@ async function handleToolCall(
     return handleWebhookTool(client, toolName, args);
   }
   if (toolName in l402Tools) {
-    return handleL402Tool(client, toolName, args);
+    // l402_pay's amount is discovered mid-call; pass the guard so it can
+    // enforce the shared cap/budget post-decode and debit on success.
+    return handleL402Tool(client, toolName, args, guard);
   }
 
   throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
@@ -239,21 +253,43 @@ async function main() {
     },
   );
 
-  // Security guard state (Phase 1/2 remediation).
+  // Security guard state.
   const securityConfig = loadSecurityConfig();
   const guardCtx: GuardContext = {
     config: securityConfig,
-    budget: new DailyBudgetTracker(),
+    ledger: new SpendLedger(), // durable, survives restarts
   };
-  const confirmTokens = new ConfirmTokenStore();
+  const approvals = new ApprovalCodeStore();
+  // Approval codes are written to stderr (not the MCP stdout channel), so they
+  // are visible to the human operator's console but never enter model context.
+  const printToStderr = (line: string): void => console.error(line);
+
+  // In stderr-code mode, advertise the optional approval_code field on spend
+  // tools so schema-validating clients can send it as part of the contract.
+  const advertiseApprovalCode =
+    securityConfig.requireConfirmation &&
+    securityConfig.approvalMode === "stderr-code";
 
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools = Object.entries(allTools).map(([name, def]) => ({
-      name,
-      description: def.description,
-      inputSchema: zodToJsonSchema(def.inputSchema),
-    }));
+    const tools = Object.entries(allTools).map(([name, def]) => {
+      const inputSchema = zodToJsonSchema(def.inputSchema);
+      if (advertiseApprovalCode && isSpendTool(name)) {
+        const props =
+          (inputSchema.properties as Record<string, unknown>) ?? {};
+        props.approval_code = {
+          type: "string",
+          description:
+            "One-time approval code printed to the server console (stderr) when confirmation is required. Ask the human operator for it; it cannot be read from tool output.",
+        };
+        inputSchema.properties = props;
+      }
+      return {
+        name,
+        description: def.description,
+        inputSchema,
+      };
+    });
 
     return { tools };
   });
@@ -278,10 +314,11 @@ async function main() {
         unknown
       >;
 
-      // ── Spend guard (Phase 1/2 remediation) ──────────────────────────────
+      // ── Spend guard ──────────────────────────────────────────────────────
       // Every money-moving tool passes allowlist + caps + budget + confirmation
-      // before it can execute. Fails closed.
-      let spentThisCall: number | null = null;
+      // before it can execute. Fails closed. For known-amount tools we also
+      // debit the durable 24h budget, but only after a successful payment.
+      let debitOnSuccess: number | null = null;
       if (isSpendTool(name)) {
         const intent = extractSpendIntent(name, validatedArgs);
         const decision = evaluateSpend(guardCtx, name, intent);
@@ -299,15 +336,18 @@ async function main() {
         }
 
         if (decision.action === "confirm") {
-          // confirm_token travels alongside the validated args (Zod strips
-          // unknown keys, so read it from the raw request).
+          // approval_code (stderr-code mode) travels alongside validated args;
+          // Zod may strip it, so also read it from the raw request.
+          const rawArgs = toolArgs as Record<string, unknown>;
           const confirmArgs = {
             ...validatedArgs,
-            confirm_token: (toolArgs as Record<string, unknown>).confirm_token,
+            approval_code:
+              (validatedArgs as Record<string, unknown>).approval_code ??
+              rawArgs.approval_code,
           };
 
-          // Use inline elicitation when the client supports it; otherwise the
-          // guard falls back to the two-step confirm-token flow.
+          // Inline elicitation when the client supports it; otherwise the guard
+          // applies the configured fallback (fail-closed or stderr-code).
           const caps = server.getClientCapabilities();
           const supportsElicitation = Boolean(caps?.elicitation);
           const elicit = supportsElicitation
@@ -330,8 +370,7 @@ async function main() {
             : null;
 
           const confirmation = await confirmSpend(
-            elicit,
-            confirmTokens,
+            { elicit, approvals, printToStderr, approvalMode: securityConfig.approvalMode },
             name,
             confirmArgs,
             decision.summary,
@@ -365,20 +404,26 @@ async function main() {
           // approved → fall through to execution
         }
 
-        // Track known amounts against the rolling 24h budget on success.
-        if (intent.amount !== null && !intent.isSweep) {
-          spentThisCall = intent.amount;
+        // Known-amount, non-sweep spends debit the shared budget on success.
+        // (l402_pay records its own decoded amount inside the handler; sweeps
+        // have no known amount to debit.)
+        if (intent.amount !== null && !intent.isSweep && name !== "l402_pay") {
+          debitOnSuccess = intent.amount;
         }
       }
 
       // Execute the tool
-      const result = await handleToolCall(blinkClient, name, validatedArgs);
+      const result = await handleToolCall(
+        blinkClient,
+        name,
+        validatedArgs,
+        guardCtx,
+      );
 
-      // Record spend against the budget only after the call returns without
-      // throwing. (Tool-level {success:false} responses still count as an
-      // attempt is conservative; we only record on non-error return.)
-      if (spentThisCall !== null) {
-        guardCtx.budget.record(spentThisCall);
+      // Debit the durable 24h budget only when the payment actually succeeded
+      // (handler returned { success: true }). Failed attempts never burn budget.
+      if (debitOnSuccess !== null && isSuccessfulSpend(result)) {
+        guardCtx.ledger.record(debitOnSuccess);
       }
 
       return {

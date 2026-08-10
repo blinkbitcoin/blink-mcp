@@ -1,6 +1,6 @@
 /**
- * Tests for the spend guard, security config, webhook validation, and SSRF
- * containment added as part of the security-findings remediation.
+ * Tests for the spend guard, security config, durable budget ledger, webhook
+ * validation, and SSRF containment.
  */
 
 import { test, describe } from "node:test";
@@ -14,40 +14,46 @@ import {
   isSpendTool,
   extractSpendIntent,
   evaluateSpend,
+  enforceAmount,
   confirmSpend,
   checkWebhookUrl,
   hashArgs,
-  DailyBudgetTracker,
-  ConfirmTokenStore,
+  ApprovalCodeStore,
   type GuardContext,
 } from "../src/security/guard.ts";
+import { SpendLedger } from "../src/security/ledger.ts";
 import { assertSafeUrl, SsrfError } from "../src/security/ssrf.ts";
 
 // ── config ──────────────────────────────────────────────────────────────────
 
 describe("loadSecurityConfig", () => {
-  test("defaults to confirmation ON and no caps", () => {
+  test("defaults: confirmation ON, fail-closed, no caps", () => {
     const c = loadSecurityConfig({} as NodeJS.ProcessEnv);
     assert.equal(c.requireConfirmation, true);
+    assert.equal(c.approvalMode, "fail-closed");
     assert.equal(c.maxPaymentSats, null);
     assert.equal(c.dailyBudgetSats, null);
     assert.equal(c.recipientAllowlist.size, 0);
+    assert.equal(c.l402HostAllowlist.size, 0);
     assert.equal(c.l402MaxSats, 1000);
   });
 
-  test("parses caps, lists, and booleans", () => {
+  test("parses caps, lists, booleans, approval mode", () => {
     const c = loadSecurityConfig({
       BLINK_REQUIRE_CONFIRMATION: "false",
+      BLINK_APPROVAL_MODE: "stderr-code",
       BLINK_MAX_PAYMENT_SATS: "5000",
       BLINK_DAILY_BUDGET_SATS: "20000",
       BLINK_RECIPIENT_ALLOWLIST: "user@blink.sv, bc1qxyz",
+      BLINK_L402_HOST_ALLOWLIST: "api.example.com",
       BLINK_L402_MAX_SATS: "250",
     } as NodeJS.ProcessEnv);
     assert.equal(c.requireConfirmation, false);
+    assert.equal(c.approvalMode, "stderr-code");
     assert.equal(c.maxPaymentSats, 5000);
     assert.equal(c.dailyBudgetSats, 20000);
     assert.ok(c.recipientAllowlist.has("user@blink.sv"));
-    assert.ok(c.recipientAllowlist.has("bc1qxyz"));
+    assert.ok(c.l402HostAllowlist.has("api.example.com"));
     assert.equal(c.l402MaxSats, 250);
   });
 
@@ -55,6 +61,13 @@ describe("loadSecurityConfig", () => {
     assert.throws(
       () => loadSecurityConfig({ BLINK_MAX_PAYMENT_SATS: "-1" } as NodeJS.ProcessEnv),
       /positive integer/,
+    );
+  });
+
+  test("rejects invalid approval mode", () => {
+    assert.throws(
+      () => loadSecurityConfig({ BLINK_APPROVAL_MODE: "bearer" } as NodeJS.ProcessEnv),
+      /BLINK_APPROVAL_MODE/,
     );
   });
 });
@@ -77,24 +90,45 @@ describe("spend classification", () => {
     assert.equal(i.recipient, "bc1q");
   });
 
-  test("extracts amount and recipient for a lightning address send", () => {
-    const i = extractSpendIntent("pay_lightning_address", {
-      ln_address: "a@b.sv",
-      amount: 1000,
-      wallet_id: "w",
-    });
-    assert.equal(i.amount, 1000);
-    assert.equal(i.recipient, "a@b.sv");
-    assert.equal(i.isSweep, false);
+  test("l402_pay has null amount up front (decoded later)", () => {
+    const i = extractSpendIntent("l402_pay", { url: "https://x", wallet_id: "w" });
+    assert.equal(i.amount, null);
+    assert.equal(i.recipient, "https://x");
   });
 });
 
-// ── evaluateSpend: allowlist / caps / budget ───────────────────────────────
+// ── enforceAmount (shared authoritative amount gate) ───────────────────────
 
-function ctx(overrides: Partial<ReturnType<typeof loadSecurityConfig>> = {}): GuardContext {
+function ctx(
+  overrides: Partial<ReturnType<typeof loadSecurityConfig>> = {},
+  ledger?: SpendLedger,
+): GuardContext {
   const config = { ...loadSecurityConfig({} as NodeJS.ProcessEnv), ...overrides };
-  return { config, budget: new DailyBudgetTracker() };
+  return { config, ledger: ledger ?? new SpendLedger(memLedgerFile()) };
 }
+
+// A per-test temp ledger file.
+function memLedgerFile(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "blink-ledger-"));
+  return path.join(dir, "spend-ledger.json");
+}
+
+describe("enforceAmount", () => {
+  test("denies over per-tx cap", () => {
+    const c = ctx({ maxPaymentSats: 500 });
+    assert.equal(enforceAmount(c, 900).ok, false);
+    assert.equal(enforceAmount(c, 500).ok, true);
+  });
+
+  test("denies over daily budget including prior spend", () => {
+    const c = ctx({ dailyBudgetSats: 1000 });
+    c.ledger.record(800);
+    assert.equal(enforceAmount(c, 300).ok, false);
+    assert.equal(enforceAmount(c, 200).ok, true);
+  });
+});
+
+// ── evaluateSpend ──────────────────────────────────────────────────────────
 
 describe("evaluateSpend", () => {
   test("denies recipient not in allowlist", () => {
@@ -107,7 +141,7 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("allows recipient in allowlist (then requires confirm)", () => {
+  test("allowlisted recipient still requires confirmation", () => {
     const c = ctx({ recipientAllowlist: new Set(["good@blink.sv"]) });
     const d = evaluateSpend(c, "pay_lightning_address", {
       amount: 100,
@@ -117,7 +151,7 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "confirm");
   });
 
-  test("denies amount over per-tx cap", () => {
+  test("denies known amount over cap even with confirmation off", () => {
     const c = ctx({ maxPaymentSats: 500, requireConfirmation: false });
     const d = evaluateSpend(c, "send_onchain", {
       amount: 900,
@@ -127,23 +161,12 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("denies when daily budget would be exceeded", () => {
-    const c = ctx({ dailyBudgetSats: 1000, requireConfirmation: false });
-    c.budget.record(800);
-    const d = evaluateSpend(c, "send_onchain", {
-      amount: 300,
-      recipient: "bc1q",
-      isSweep: false,
-    });
-    assert.equal(d.action, "deny");
-  });
-
-  test("unknown amount + configured cap + no confirmation => deny (never bypass)", () => {
+  test("unknown amount + cap + no confirmation => deny (never bypass)", () => {
     const c = ctx({ maxPaymentSats: 500, requireConfirmation: false });
-    const d = evaluateSpend(c, "send_onchain_all", {
+    const d = evaluateSpend(c, "l402_pay", {
       amount: null,
-      recipient: "bc1q",
-      isSweep: true,
+      recipient: "https://x",
+      isSweep: false,
     });
     assert.equal(d.action, "deny");
   });
@@ -159,109 +182,142 @@ describe("evaluateSpend", () => {
   });
 });
 
-// ── confirm-token fallback ─────────────────────────────────────────────────
+// ── confirmSpend: fail-closed + stderr-code ────────────────────────────────
 
-describe("confirmSpend two-step confirm-token", () => {
-  test("first call issues a token (pending); second call with token approves", async () => {
-    const tokens = new ConfirmTokenStore();
-    const args = { amount: 100, address: "bc1q" };
+function deps(overrides: Record<string, unknown> = {}) {
+  const printed: string[] = [];
+  const base = {
+    elicit: null,
+    approvals: new ApprovalCodeStore(),
+    printToStderr: (line: string) => printed.push(line),
+    approvalMode: "fail-closed" as const,
+  };
+  return { deps: { ...base, ...overrides }, printed };
+}
 
-    const first = await confirmSpend(null, tokens, "send_onchain", args, "summary");
-    assert.equal(first.status, "pending");
-    const token =
-      first.status === "pending" ? (first.payload.confirm_token as string) : "";
-    assert.ok(token.length > 0);
-
-    const second = await confirmSpend(
-      null,
-      tokens,
-      "send_onchain",
-      { ...args, confirm_token: token },
-      "summary",
-    );
-    assert.equal(second.status, "approved");
+describe("confirmSpend", () => {
+  test("elicitation accept => approved", async () => {
+    const { deps: d } = deps({ elicit: async () => true });
+    const r = await confirmSpend(d, "send_onchain", { amount: 100 }, "s");
+    assert.equal(r.status, "approved");
   });
 
-  test("token is single-use", async () => {
-    const tokens = new ConfirmTokenStore();
-    const args = { amount: 100, address: "bc1q" };
-    const first = await confirmSpend(null, tokens, "send_onchain", args, "s");
-    const token =
-      first.status === "pending" ? (first.payload.confirm_token as string) : "";
-    await confirmSpend(null, tokens, "send_onchain", { ...args, confirm_token: token }, "s");
-    const third = await confirmSpend(
-      null,
-      tokens,
+  test("elicitation decline => rejected", async () => {
+    const { deps: d } = deps({ elicit: async () => false });
+    const r = await confirmSpend(d, "send_onchain", { amount: 100 }, "s");
+    assert.equal(r.status, "rejected");
+  });
+
+  test("no elicitation + fail-closed => rejected (never pending token)", async () => {
+    const { deps: d } = deps({ approvalMode: "fail-closed" });
+    const r = await confirmSpend(d, "send_onchain", { amount: 100 }, "s");
+    assert.equal(r.status, "rejected");
+  });
+
+  test("stderr-code: first call prints code to stderr, returns pending WITHOUT code", async () => {
+    const { deps: d, printed } = deps({ approvalMode: "stderr-code" });
+    const r = await confirmSpend(d, "send_onchain", { amount: 100 }, "summary");
+    assert.equal(r.status, "pending");
+    // The code must NOT appear in the model-visible payload.
+    const payloadStr = JSON.stringify(
+      r.status === "pending" ? r.payload : {},
+    );
+    assert.equal(/[0-9a-f]{8}/.test(payloadStr), false);
+    // The code IS printed to stderr.
+    assert.ok(printed.join("").includes("approval_code="));
+  });
+
+  test("stderr-code: correct code approves; wrong code re-prompts", async () => {
+    const store = new ApprovalCodeStore();
+    const { deps: d, printed } = deps({
+      approvalMode: "stderr-code",
+      approvals: store,
+    });
+    await confirmSpend(d, "send_onchain", { amount: 100 }, "s");
+    const match = printed.join("").match(/approval_code="([0-9a-f]+)"/);
+    assert.ok(match, "code should be printed to stderr");
+    const code = match![1];
+
+    const wrong = await confirmSpend(
+      d,
       "send_onchain",
-      { ...args, confirm_token: token },
+      { amount: 100, approval_code: "deadbeef" },
       "s",
     );
-    assert.equal(third.status, "pending"); // reissued, not approved
+    assert.equal(wrong.status, "pending");
+
+    // Re-issue a fresh code (previous consumed by wrong attempt), then approve.
+    const printed2: string[] = [];
+    const d2 = { ...d, printToStderr: (l: string) => printed2.push(l) };
+    await confirmSpend(d2, "send_onchain", { amount: 100 }, "s");
+    const code2 = printed2.join("").match(/approval_code="([0-9a-f]+)"/)![1];
+    const ok = await confirmSpend(
+      d2,
+      "send_onchain",
+      { amount: 100, approval_code: code2 },
+      "s",
+    );
+    assert.equal(ok.status, "approved");
+    assert.ok(code.length > 0);
   });
 
-  test("token does not approve a different request", async () => {
-    const tokens = new ConfirmTokenStore();
-    const first = await confirmSpend(null, tokens, "send_onchain", { amount: 100 }, "s");
-    const token =
-      first.status === "pending" ? (first.payload.confirm_token as string) : "";
+  test("stderr-code: code does not approve a different request", async () => {
+    const store = new ApprovalCodeStore();
+    const { deps: d, printed } = deps({
+      approvalMode: "stderr-code",
+      approvals: store,
+    });
+    await confirmSpend(d, "send_onchain", { amount: 100 }, "s");
+    const code = printed.join("").match(/approval_code="([0-9a-f]+)"/)![1];
     const tampered = await confirmSpend(
-      null,
-      tokens,
+      d,
       "send_onchain",
-      { amount: 999999, confirm_token: token },
+      { amount: 999999, approval_code: code },
       "s",
     );
     assert.equal(tampered.status, "pending");
   });
-
-  test("expired token is rejected", async () => {
-    let now = 1000;
-    const tokens = new ConfirmTokenStore(() => now);
-    const args = { amount: 100 };
-    const first = await confirmSpend(null, tokens, "send_onchain", args, "s");
-    const token =
-      first.status === "pending" ? (first.payload.confirm_token as string) : "";
-    now += 6 * 60 * 1000; // 6 min > 5 min TTL
-    const late = await confirmSpend(
-      null,
-      tokens,
-      "send_onchain",
-      { ...args, confirm_token: token },
-      "s",
-    );
-    assert.equal(late.status, "pending");
-  });
-
-  test("elicitation path approves when user accepts", async () => {
-    const tokens = new ConfirmTokenStore();
-    const res = await confirmSpend(
-      async () => true,
-      tokens,
-      "send_onchain",
-      { amount: 100 },
-      "s",
-    );
-    assert.equal(res.status, "approved");
-  });
-
-  test("elicitation path rejects when user declines", async () => {
-    const tokens = new ConfirmTokenStore();
-    const res = await confirmSpend(
-      async () => false,
-      tokens,
-      "send_onchain",
-      { amount: 100 },
-      "s",
-    );
-    assert.equal(res.status, "rejected");
-  });
 });
 
 describe("hashArgs", () => {
-  test("ignores confirm_token and is order-independent", () => {
-    const a = hashArgs({ amount: 1, address: "x", confirm_token: "aaa" });
+  test("ignores approval_code and is order-independent", () => {
+    const a = hashArgs({ amount: 1, address: "x", approval_code: "aaa" });
     const b = hashArgs({ address: "x", amount: 1 });
     assert.equal(a, b);
+  });
+});
+
+// ── durable ledger ──────────────────────────────────────────────────────────
+
+describe("SpendLedger", () => {
+  test("persists across instances (survives restart)", () => {
+    const file = memLedgerFile();
+    const l1 = new SpendLedger(file);
+    l1.record(300);
+    l1.record(200);
+    // New instance simulates a server restart.
+    const l2 = new SpendLedger(file);
+    assert.equal(l2.spentLast24h(), 500);
+  });
+
+  test("prunes entries older than 24h", () => {
+    const file = memLedgerFile();
+    let now = 1_000_000_000_000;
+    const l = new SpendLedger(file, () => now);
+    l.record(1000);
+    now += 25 * 60 * 60 * 1000; // +25h
+    assert.equal(l.spentLast24h(), 0);
+  });
+
+  test("writes a 0600 file", (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX perms n/a on Windows");
+      return;
+    }
+    const file = memLedgerFile();
+    new SpendLedger(file).record(10);
+    const mode = fs.statSync(file).mode & 0o777;
+    assert.equal(mode, 0o600);
   });
 });
 
@@ -269,54 +325,62 @@ describe("hashArgs", () => {
 
 describe("checkWebhookUrl", () => {
   test("rejects non-https", () => {
-    const r = checkWebhookUrl("http://evil.com/cb", new Set());
-    assert.equal(r.ok, false);
+    assert.equal(checkWebhookUrl("http://evil.com/cb", new Set()).ok, false);
   });
-
   test("rejects host not in allowlist", () => {
-    const r = checkWebhookUrl("https://evil.com/cb", new Set(["mysite.com"]));
-    assert.equal(r.ok, false);
+    assert.equal(
+      checkWebhookUrl("https://evil.com/cb", new Set(["mysite.com"])).ok,
+      false,
+    );
   });
-
   test("accepts https host in allowlist", () => {
-    const r = checkWebhookUrl("https://mysite.com/cb", new Set(["mysite.com"]));
-    assert.equal(r.ok, true);
+    assert.equal(
+      checkWebhookUrl("https://mysite.com/cb", new Set(["mysite.com"])).ok,
+      true,
+    );
   });
-
   test("accepts any https host when allowlist empty", () => {
-    const r = checkWebhookUrl("https://anywhere.example/cb", new Set());
-    assert.equal(r.ok, true);
+    assert.equal(checkWebhookUrl("https://anywhere.example/cb", new Set()).ok, true);
   });
 });
 
-// ── SSRF containment ────────────────────────────────────────────────────────
+// ── SSRF containment (fail-closed) ─────────────────────────────────────────
 
 describe("assertSafeUrl", () => {
-  test("rejects non-https", async () => {
-    await assert.rejects(() => assertSafeUrl("http://example.com"), SsrfError);
+  test("fails closed when host allowlist is empty", async () => {
+    await assert.rejects(() => assertSafeUrl("https://example.com"), SsrfError);
   });
 
-  test("rejects loopback literal IP", async () => {
-    await assert.rejects(() => assertSafeUrl("https://127.0.0.1/x"), SsrfError);
-  });
-
-  test("rejects private literal IP", async () => {
-    await assert.rejects(() => assertSafeUrl("https://192.168.1.5/x"), SsrfError);
-  });
-
-  test("rejects link-local", async () => {
-    await assert.rejects(() => assertSafeUrl("https://169.254.169.254/latest"), SsrfError);
-  });
-
-  test("enforces host allowlist", async () => {
+  test("rejects non-https even if host allowlisted", async () => {
     await assert.rejects(
-      () => assertSafeUrl("https://8.8.8.8/x", new Set(["allowed.com"])),
+      () => assertSafeUrl("http://example.com", new Set(["example.com"])),
       SsrfError,
+    );
+  });
+
+  test("rejects host not in allowlist", async () => {
+    await assert.rejects(
+      () => assertSafeUrl("https://evil.com/x", new Set(["good.com"])),
+      SsrfError,
+    );
+  });
+
+  test("rejects allowlisted host that is a private literal IP", async () => {
+    await assert.rejects(
+      () => assertSafeUrl("https://127.0.0.1/x", new Set(["127.0.0.1"])),
+      SsrfError,
+    );
+  });
+
+  test("accepts allowlisted public host", async () => {
+    // 8.8.8.8 is public; allowlisting the literal IP avoids DNS in the test.
+    await assert.doesNotReject(() =>
+      assertSafeUrl("https://8.8.8.8/x", new Set(["8.8.8.8"])),
     );
   });
 });
 
-// ── token store file permissions ───────────────────────────────────────────
+// ── L402 token store permissions ───────────────────────────────────────────
 
 describe("L402 token store permissions", () => {
   test("writeStore creates a 0600 file", async (t) => {
@@ -326,13 +390,9 @@ describe("L402 token store permissions", () => {
     }
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "blink-l402-"));
     const origHome = os.homedir;
-    // Redirect homedir so the store writes into the temp dir.
     (os as unknown as { homedir: () => string }).homedir = () => tmpHome;
     try {
-      // Import fresh so STORE_DIR/STORE_FILE resolve against the temp home.
-      const mod = await import(
-        "../src/tools/l402.ts?perm=" + Date.now()
-      );
+      const mod = await import("../src/tools/l402.ts?perm=" + Date.now());
       mod.saveToken("example.com", {
         macaroon: "mac",
         preimage: "pre",

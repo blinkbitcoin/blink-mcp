@@ -50,8 +50,15 @@ function ipIsPrivate(ip: string): boolean {
 
 /**
  * Validate a URL for outbound L402 fetches. Throws SsrfError when the URL is
- * not HTTPS, malformed, or resolves to a non-public address. Optionally
- * enforces a hostname allowlist (empty set = allow any public host).
+ * not HTTPS, malformed, resolves to a non-public address, or is not on the
+ * host allowlist.
+ *
+ * The allowlist is MANDATORY (fail-closed on empty). Node's global fetch
+ * re-resolves DNS at request time, so a pre-flight IP check alone is subject to
+ * a DNS-rebinding TOCTOU. Constraining which hostnames may be contacted at all
+ * removes the attacker's ability to point the server at arbitrary internal
+ * hosts. The public-IP check is retained as defence-in-depth for allowlisted
+ * hosts and is re-run for every redirect hop by the caller.
  */
 export async function assertSafeUrl(
   rawUrl: string,
@@ -72,8 +79,13 @@ export async function assertSafeUrl(
 
   const host = url.hostname.toLowerCase();
 
-  if (allowlist.size > 0 && !allowlist.has(host)) {
-    throw new SsrfError(`Host "${host}" is not in the L402 host allowlist.`);
+  if (allowlist.size === 0) {
+    throw new SsrfError(
+      "L402 server-side fetches require BLINK_L402_HOST_ALLOWLIST to be set (fail-closed). No hosts are allowed by default.",
+    );
+  }
+  if (!allowlist.has(host)) {
+    throw new SsrfError(`Host "${host}" is not in BLINK_L402_HOST_ALLOWLIST.`);
   }
 
   // If the host is already a literal IP, check it directly.

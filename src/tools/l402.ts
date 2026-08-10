@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import type { BlinkClient } from "../client.js";
 import { assertSafeUrl, SsrfError } from "../security/ssrf.js";
 import { loadSecurityConfig } from "../security/config.js";
+import { enforceAmount, type GuardContext } from "../security/guard.js";
 
 // ── Token store ───────────────────────────────────────────────────────────────
 
@@ -691,6 +692,7 @@ export async function handleL402Tool(
   client: BlinkClient,
   toolName: string,
   args: Record<string, unknown>,
+  guard?: GuardContext,
 ): Promise<unknown> {
   const security = loadSecurityConfig();
   const l402Allowlist = security.l402HostAllowlist;
@@ -980,7 +982,7 @@ export async function handleL402Tool(
         };
       }
 
-      // Mandatory budget check against the effective cap.
+      // Mandatory L402 cap against the effective cap.
       if (satoshis !== null && satoshis > effectiveMaxSats) {
         return {
           success: false,
@@ -991,6 +993,23 @@ export async function handleL402Tool(
           maxAmount: effectiveMaxSats,
           message: `Payment of ${satoshis} sats exceeds the max of ${effectiveMaxSats} sats (max_amount_sats or BLINK_L402_MAX_SATS). Aborting.`,
         };
+      }
+
+      // Global guard: the discovered amount must also satisfy the shared
+      // BLINK_MAX_PAYMENT_SATS per-tx cap and the rolling 24h budget. This is
+      // the same gate every other spend tool uses; l402_pay is not exempt.
+      if (guard && satoshis !== null && !dry_run) {
+        const gate = enforceAmount(guard, satoshis);
+        if (!gate.ok) {
+          return {
+            success: false,
+            event: "l402_budget_exceeded",
+            url,
+            canonicalUrl: canonicalUrl !== url ? canonicalUrl : undefined,
+            satoshis,
+            message: gate.reason,
+          };
+        }
       }
 
       // Dry run — report price, no payment
@@ -1039,6 +1058,12 @@ export async function handleL402Tool(
           error: `Payment not successful: status=${payResponse.status}`,
           url,
         };
+      }
+
+      // Debit the durable 24h budget only on a real, successful payment
+      // (status SUCCESS pays; ALREADY_PAID moved no new funds).
+      if (guard && satoshis !== null && payResponse.status === "SUCCESS") {
+        guard.ledger.record(satoshis);
       }
 
       // Extract preimage

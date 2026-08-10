@@ -286,29 +286,48 @@ explicit confirmation before running.
 | Variable | Default | Effect |
 | -------- | ------- | ------ |
 | `BLINK_REQUIRE_CONFIRMATION` | `true` | Require confirmation before any spend |
-| `BLINK_MAX_PAYMENT_SATS` | _(none)_ | Per-transaction cap in sats |
-| `BLINK_DAILY_BUDGET_SATS` | _(none)_ | Rolling 24h spend cap in sats |
+| `BLINK_APPROVAL_MODE` | `fail-closed` | Fallback when the client can't do elicitation: `fail-closed` or `stderr-code` |
+| `BLINK_MAX_PAYMENT_SATS` | _(none)_ | Per-transaction cap in sats (authoritative for all spends, incl. `l402_pay`) |
+| `BLINK_DAILY_BUDGET_SATS` | _(none)_ | Rolling 24h spend cap in sats (durable across restarts) |
 | `BLINK_RECIPIENT_ALLOWLIST` | _(none)_ | Allowed recipients (ln addr / username / btc addr / wallet id) |
 | `BLINK_WEBHOOK_ALLOWLIST` | _(none)_ | Allowed webhook callback hostnames |
 | `BLINK_L402_MAX_SATS` | `1000` | Mandatory default cap for `l402_pay` |
-| `BLINK_L402_HOST_ALLOWLIST` | _(none)_ | Allowed hostnames for L402 fetches |
+| `BLINK_L402_HOST_ALLOWLIST` | _(none)_ | **Required** for L402 network access; fail-closed when unset |
 
 **Confirmation flow.** When the MCP client supports
 [elicitation](https://modelcontextprotocol.io/), the guard prompts inline and
-blocks until the user accepts. For clients without elicitation support, it uses
-a **two-step confirm-token** flow: the first tool call returns
-`requires_confirmation` with a single-use, 5-minute `confirm_token`; the model
-must re-invoke the tool with identical arguments plus that token to proceed.
+blocks until the user accepts — this is the preferred, injection-safe path.
+
+For clients **without** elicitation support, a token returned through the tool
+channel is *not* a human boundary (a prompt-injected loop could simply echo it
+back), so there is no such token. Instead `BLINK_APPROVAL_MODE` controls the
+fallback:
+
+- **`fail-closed`** (default): the spend is refused.
+- **`stderr-code`**: the server prints a one-time approval code to its **console
+  (stderr)** — which the model cannot read — and the human operator re-issues
+  the tool call with `approval_code="<code>"`. The code never enters model
+  context, so injection alone cannot obtain it.
+
+**Amount enforcement.** `BLINK_MAX_PAYMENT_SATS` and `BLINK_DAILY_BUDGET_SATS`
+are enforced for every spend tool. For `l402_pay`, whose amount is only known
+after fetching the invoice, the caps are re-checked *after decoding* and before
+payment; the 24h budget is debited only on a **successful** payment (failed
+attempts never burn budget). The budget is persisted to a `0600` ledger at
+`~/.blink/spend-ledger.json` so it survives restarts.
 
 **Sweeps and unknown amounts.** `send_onchain_all` (full-balance sweep) and any
 payment whose amount is not known up front always require confirmation and are
 never auto-approved by budget checks alone.
 
 **L402 hardening.** `l402_pay` enforces a mandatory spend cap
-(`max_amount_sats` or `BLINK_L402_MAX_SATS`), refuses invoices whose amount
-cannot be decoded, and blocks non-HTTPS or private/loopback/link-local URLs
-(SSRF protection). Cached L402 tokens are stored `0600`, and
-`l402_store get` masks payment secrets unless called with `reveal: true`.
+(`max_amount_sats` or `BLINK_L402_MAX_SATS`) plus the global caps above, and
+refuses invoices whose amount cannot be decoded. Server-side L402 fetches
+**require `BLINK_L402_HOST_ALLOWLIST`** (fail-closed when unset), are HTTPS-only,
+reject private/loopback/link-local addresses, and re-validate every redirect
+hop — mitigating DNS-rebinding SSRF without socket pinning. Cached L402 tokens
+are stored `0600`, and `l402_store get` masks payment secrets unless called
+with `reveal: true`.
 
 **Webhooks.** `add_webhook` requires an HTTPS URL and, when
 `BLINK_WEBHOOK_ALLOWLIST` is set, a listed hostname.

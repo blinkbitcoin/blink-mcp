@@ -3,15 +3,20 @@
 // Central control point for every money-moving tool. Sits between Zod
 // validation and tool dispatch (see src/index.ts). Enforces, in order:
 //   1. recipient allowlist
-//   2. per-transaction cap
-//   3. rolling 24h daily budget
-//   4. human confirmation (via MCP elicitation, or a two-step confirm-token
-//      fallback for clients that don't support elicitation)
+//   2. per-transaction cap (BLINK_MAX_PAYMENT_SATS)
+//   3. rolling 24h daily budget (durable, BLINK_DAILY_BUDGET_SATS)
+//   4. human confirmation (via MCP elicitation; otherwise fail-closed, or an
+//      out-of-band stderr approval code the model cannot read)
+//
+// For tools whose amount is unknown up front (l402_pay), the amount checks are
+// re-run post-decode via enforceAmount() before the payment is sent, and the
+// budget is debited only on a successful payment.
 //
 // Any failed check returns a structured refusal and executes NOTHING.
 
 import crypto from "node:crypto";
 import type { SecurityConfig } from "./config.js";
+import type { SpendLedger } from "./ledger.js";
 
 // ── Spend tool classification ──────────────────────────────────────────────
 
@@ -89,77 +94,70 @@ export function extractSpendIntent(
   }
 }
 
-// ── Rolling 24h budget tracker ─────────────────────────────────────────────
+// ── Out-of-band approval code store (stderr-code mode) ──────────────────────
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-export class DailyBudgetTracker {
-  private spends: Array<{ at: number; amount: number }> = [];
-
-  constructor(private now: () => number = Date.now) {}
-
-  private prune(): void {
-    const cutoff = this.now() - DAY_MS;
-    this.spends = this.spends.filter((s) => s.at >= cutoff);
-  }
-
-  spentLast24h(): number {
-    this.prune();
-    return this.spends.reduce((sum, s) => sum + s.amount, 0);
-  }
-
-  record(amount: number): void {
-    this.spends.push({ at: this.now(), amount });
-  }
-}
-
-// ── Confirm-token store (two-step fallback) ────────────────────────────────
-
-interface PendingConfirmation {
+interface PendingApproval {
+  code: string;
   toolName: string;
   argsHash: string;
   expiresAt: number;
 }
 
-const CONFIRM_TTL_MS = 5 * 60 * 1000;
+const APPROVAL_TTL_MS = 5 * 60 * 1000;
 
-export class ConfirmTokenStore {
-  private pending = new Map<string, PendingConfirmation>();
+/**
+ * Holds one-time approval codes for the stderr-code fallback. The code is
+ * printed to the server's stderr (NOT returned to the model), so an injected
+ * agent loop cannot read it — only a human watching the server console can.
+ */
+export class ApprovalCodeStore {
+  private pending = new Map<string, PendingApproval>();
 
   constructor(private now: () => number = Date.now) {}
 
   private prune(): void {
     const t = this.now();
-    for (const [token, p] of this.pending) {
-      if (p.expiresAt <= t) this.pending.delete(token);
+    for (const [key, p] of this.pending) {
+      if (p.expiresAt <= t) this.pending.delete(key);
     }
   }
 
-  issue(toolName: string, argsHash: string): string {
-    this.prune();
-    const token = crypto.randomBytes(16).toString("hex");
-    this.pending.set(token, {
-      toolName,
-      argsHash,
-      expiresAt: this.now() + CONFIRM_TTL_MS,
-    });
-    return token;
+  private key(toolName: string, argsHash: string): string {
+    return `${toolName}:${argsHash}`;
   }
 
-  /** Single-use: consumes the token. Returns true only on an exact, live match. */
-  consume(token: string, toolName: string, argsHash: string): boolean {
+  /** Issue (or reissue) a code for this exact request. Returns the code. */
+  issue(toolName: string, argsHash: string): string {
     this.prune();
-    const p = this.pending.get(token);
+    // 8 hex chars is enough entropy for a short-lived, human-typed code.
+    const code = crypto.randomBytes(4).toString("hex");
+    this.pending.set(this.key(toolName, argsHash), {
+      code,
+      toolName,
+      argsHash,
+      expiresAt: this.now() + APPROVAL_TTL_MS,
+    });
+    return code;
+  }
+
+  /** Single-use, constant-time check that the supplied code matches. */
+  consume(code: string, toolName: string, argsHash: string): boolean {
+    this.prune();
+    const k = this.key(toolName, argsHash);
+    const p = this.pending.get(k);
     if (!p) return false;
-    this.pending.delete(token);
+    this.pending.delete(k);
     if (p.expiresAt <= this.now()) return false;
-    return p.toolName === toolName && p.argsHash === argsHash;
+    const a = Buffer.from(p.code);
+    const b = Buffer.from(code);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   }
 }
 
-/** Stable hash of the spend args, excluding the confirm_token field itself. */
+/** Stable hash of the spend args, excluding the approval_code field itself. */
 export function hashArgs(args: Record<string, unknown>): string {
-  const { confirm_token: _omit, ...rest } = args;
+  const { approval_code: _omit, ...rest } = args;
   const canonical = JSON.stringify(rest, Object.keys(rest).sort());
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
@@ -177,11 +175,41 @@ export type GuardDecision =
 
 export interface GuardContext {
   config: SecurityConfig;
-  budget: DailyBudgetTracker;
+  ledger: SpendLedger;
 }
 
 function allowlistKey(v: string): string {
   return v.trim().toLowerCase();
+}
+
+/**
+ * Enforce the per-transaction cap and rolling 24h budget for a KNOWN amount.
+ * Used both pre-dispatch (for tools that carry an amount) and post-decode (for
+ * l402_pay, whose amount is only known after fetching the invoice). This is the
+ * single authoritative amount gate — no tool may bypass BLINK_MAX_PAYMENT_SATS
+ * or BLINK_DAILY_BUDGET_SATS.
+ */
+export function enforceAmount(
+  ctx: GuardContext,
+  amount: number,
+): { ok: true } | { ok: false; reason: string } {
+  const { config, ledger } = ctx;
+  if (config.maxPaymentSats !== null && amount > config.maxPaymentSats) {
+    return {
+      ok: false,
+      reason: `Amount ${amount} exceeds per-transaction cap BLINK_MAX_PAYMENT_SATS=${config.maxPaymentSats}. Refusing.`,
+    };
+  }
+  if (config.dailyBudgetSats !== null) {
+    const already = ledger.spentLast24h();
+    if (already + amount > config.dailyBudgetSats) {
+      return {
+        ok: false,
+        reason: `Amount ${amount} would exceed the 24h budget BLINK_DAILY_BUDGET_SATS=${config.dailyBudgetSats} (already spent ${already}). Refusing.`,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 /**
@@ -194,7 +222,7 @@ export function evaluateSpend(
   toolName: string,
   intent: SpendIntent,
 ): GuardDecision {
-  const { config, budget } = ctx;
+  const { config } = ctx;
 
   // 1. Recipient allowlist (all recipient types).
   if (config.recipientAllowlist.size > 0) {
@@ -213,26 +241,17 @@ export function evaluateSpend(
     }
   }
 
-  // 2 & 3. Cap and budget checks only apply when the amount is known.
+  // 2 & 3. Cap and budget checks when the amount is known up front. For tools
+  // whose amount is unknown here (l402_pay), these are re-run post-decode via
+  // enforceAmount() before payment — never skipped.
   if (intent.amount !== null) {
-    if (config.maxPaymentSats !== null && intent.amount > config.maxPaymentSats) {
-      return {
-        action: "deny",
-        reason: `Amount ${intent.amount} exceeds per-transaction cap BLINK_MAX_PAYMENT_SATS=${config.maxPaymentSats}. Refusing.`,
-      };
-    }
-    if (config.dailyBudgetSats !== null) {
-      const projected = budget.spentLast24h() + intent.amount;
-      if (projected > config.dailyBudgetSats) {
-        return {
-          action: "deny",
-          reason: `Amount ${intent.amount} would exceed the 24h budget BLINK_DAILY_BUDGET_SATS=${config.dailyBudgetSats} (already spent ${budget.spentLast24h()}). Refusing.`,
-        };
-      }
+    const amountCheck = enforceAmount(ctx, intent.amount);
+    if (!amountCheck.ok) {
+      return { action: "deny", reason: amountCheck.reason };
     }
   } else if (config.maxPaymentSats !== null || config.dailyBudgetSats !== null) {
-    // Unknown amount + a configured cap: cannot verify, so force confirmation.
-    // (Never silently bypass a budget on an undecodable amount.)
+    // Unknown amount + a configured cap: cannot verify here. Require
+    // confirmation so a human is in the loop; the amount gate still runs later.
     if (!config.requireConfirmation) {
       return {
         action: "deny",
@@ -306,6 +325,8 @@ export function describeSpend(toolName: string, intent: SpendIntent): string {
 export type ConfirmationResult =
   | { status: "approved" }
   | { status: "rejected"; reason: string }
+  // Awaiting an out-of-band approval code (stderr-code mode). The payload is
+  // returned to the model; it deliberately does NOT contain the code.
   | { status: "pending"; payload: Record<string, unknown> };
 
 /**
@@ -314,24 +335,37 @@ export type ConfirmationResult =
  */
 export type ElicitApproval = (summary: string) => Promise<boolean>;
 
+export interface ConfirmSpendDeps {
+  /** Inline elicitation callback when the client supports it, else null. */
+  elicit: ElicitApproval | null;
+  /** Store for out-of-band approval codes (stderr-code mode). */
+  approvals: ApprovalCodeStore;
+  /** Writes a line to the server's stderr (not visible to the model). */
+  printToStderr: (line: string) => void;
+  approvalMode: SecurityConfig["approvalMode"];
+}
+
 /**
  * Obtain human confirmation for a spend.
  *
  * Path A — client supports elicitation (`elicit` provided): prompt inline and
- * block on the answer.
- * Path B — no elicitation (`elicit` null): two-step confirm-token. If the caller
- * supplied a valid confirm_token that matches this exact request, approve;
- * otherwise issue a fresh token and return a "pending" payload to echo back.
+ * block on the answer. This is the preferred, injection-safe path.
+ *
+ * Path B — no elicitation. A model-visible token is NOT a human boundary
+ * (a prompt-injected loop could just echo it back), so:
+ *   - approvalMode "fail-closed" (default): refuse.
+ *   - approvalMode "stderr-code": print a one-time code to the SERVER STDERR
+ *     (which the model cannot read) and require the human to echo it back via
+ *     approval_code. The code never enters model context.
  */
 export async function confirmSpend(
-  elicit: ElicitApproval | null,
-  tokens: ConfirmTokenStore,
+  deps: ConfirmSpendDeps,
   toolName: string,
   args: Record<string, unknown>,
   summary: string,
 ): Promise<ConfirmationResult> {
-  if (elicit) {
-    const approved = await elicit(summary);
+  if (deps.elicit) {
+    const approved = await deps.elicit(summary);
     if (approved) return { status: "approved" };
     return {
       status: "rejected",
@@ -339,23 +373,35 @@ export async function confirmSpend(
     };
   }
 
-  // Two-step confirm-token fallback.
+  if (deps.approvalMode === "fail-closed") {
+    return {
+      status: "rejected",
+      reason:
+        "This MCP client cannot obtain human approval (no elicitation support), and BLINK_APPROVAL_MODE is fail-closed. Refusing the payment. Use an elicitation-capable client, or set BLINK_APPROVAL_MODE=stderr-code to approve via the server console.",
+    };
+  }
+
+  // stderr-code mode.
   const argsHash = hashArgs(args);
-  const supplied = typeof args.confirm_token === "string" ? args.confirm_token : "";
-  if (supplied && tokens.consume(supplied, toolName, argsHash)) {
+  const supplied =
+    typeof args.approval_code === "string" ? args.approval_code : "";
+  if (supplied && deps.approvals.consume(supplied, toolName, argsHash)) {
     return { status: "approved" };
   }
 
-  const token = tokens.issue(toolName, argsHash);
+  const code = deps.approvals.issue(toolName, argsHash);
+  deps.printToStderr(
+    `\n[APPROVAL REQUIRED] ${summary}\n` +
+      `[APPROVAL REQUIRED] To authorize, have the user re-issue this tool call with approval_code="${code}" (valid 5 min).\n`,
+  );
   return {
     status: "pending",
     payload: {
       success: false,
-      requires_confirmation: true,
+      requires_approval: true,
       summary,
-      confirm_token: token,
       message:
-        "This is a money-moving action. To proceed, call this tool again with the SAME arguments plus the provided confirm_token. The token is single-use and expires in 5 minutes. Only do this if the user explicitly authorized the payment.",
+        "A one-time approval code was printed to the server console (stderr). Ask the human operator to read it from the console and re-issue this exact tool call with that approval_code. The code is NOT included in this response and cannot be obtained from tool output.",
     },
   };
 }
