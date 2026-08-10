@@ -271,6 +271,71 @@ This MCP server wraps the [Blink GraphQL API](https://dev.blink.sv/). For detail
 - **Write Operations**: Be cautious with write permissions as they allow sending funds
 - **Environment Variables**: Store API keys in environment variables, not in config files
 
+### Spend Guard
+
+Because this server holds a Blink API key and exposes tools that move funds, an
+agent processing untrusted content (a web page, email, invoice memo, etc.) could
+be steered into making a payment via indirect prompt injection. To mitigate
+this, every money-moving tool passes through a central **spend guard** before it
+executes, enforcing (in order): recipient allowlist → per-transaction cap →
+rolling 24h budget → **human confirmation**.
+
+The guard is **safe-by-default**: with no configuration, all spend tools require
+explicit confirmation before running.
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| `BLINK_REQUIRE_CONFIRMATION` | `true` | Require confirmation before any spend |
+| `BLINK_APPROVAL_MODE` | `fail-closed` | Fallback when the client can't do elicitation: `fail-closed` or `stderr-code` |
+| `BLINK_MAX_PAYMENT_SATS` | _(none)_ | Per-transaction cap in sats (authoritative for all spends, incl. `l402_pay`) |
+| `BLINK_DAILY_BUDGET_SATS` | _(none)_ | Rolling 24h spend cap in sats (durable across restarts) |
+| `BLINK_RECIPIENT_ALLOWLIST` | _(none)_ | Allowed recipients (ln addr / username / btc addr / wallet id) |
+| `BLINK_WEBHOOK_ALLOWLIST` | _(none)_ | Allowed webhook callback hostnames |
+| `BLINK_L402_MAX_SATS` | `1000` | Mandatory default cap for `l402_pay` |
+| `BLINK_L402_HOST_ALLOWLIST` | _(none)_ | **Required** for L402 network access; fail-closed when unset |
+
+**Confirmation flow.** When the MCP client supports
+[elicitation](https://modelcontextprotocol.io/), the guard prompts inline and
+blocks until the user accepts — this is the preferred, injection-safe path.
+
+For clients **without** elicitation support, a token returned through the tool
+channel is *not* a human boundary (a prompt-injected loop could simply echo it
+back), so there is no such token. Instead `BLINK_APPROVAL_MODE` controls the
+fallback:
+
+- **`fail-closed`** (default): the spend is refused.
+- **`stderr-code`**: the server prints a one-time approval code to its **console
+  (stderr)** — which the model cannot read — and the human operator re-issues
+  the tool call with `approval_code="<code>"`. The code never enters model
+  context, so injection alone cannot obtain it.
+
+**Amount enforcement.** `BLINK_MAX_PAYMENT_SATS` and `BLINK_DAILY_BUDGET_SATS`
+are enforced for every spend tool. Fixed-amount Lightning invoices are decoded
+from the bolt11 before payment so `pay_invoice` is subject to the same caps and
+budget as amount-carrying tools. For `l402_pay`, whose amount is only known
+after fetching the invoice, the caps are re-checked *after decoding* and before
+payment. The 24h budget is debited only on a **successful** payment (failed
+attempts never burn budget) and is persisted to a `0600` ledger at
+`~/.blink/spend-ledger.json` so it survives restarts.
+
+**Sweeps and undecodable amounts.** When a per-transaction cap or daily budget
+is configured, `send_onchain_all` (full-balance sweep) and any `pay_invoice`
+whose bolt11 amount cannot be decoded are **refused** — the amount cannot be
+verified against the cap, so the guard fails closed rather than bypassing it.
+With no caps configured, these still require confirmation.
+
+**L402 hardening.** `l402_pay` enforces a mandatory spend cap
+(`max_amount_sats` or `BLINK_L402_MAX_SATS`) plus the global caps above, and
+refuses invoices whose amount cannot be decoded. Server-side L402 fetches
+**require `BLINK_L402_HOST_ALLOWLIST`** (fail-closed when unset), are HTTPS-only,
+reject private/loopback/link-local addresses, and re-validate every redirect
+hop — mitigating DNS-rebinding SSRF without socket pinning. Cached L402 tokens
+are stored `0600`, and `l402_store get` masks payment secrets unless called
+with `reveal: true`.
+
+**Webhooks.** `add_webhook` requires an HTTPS URL and, when
+`BLINK_WEBHOOK_ALLOWLIST` is set, a listed hostname.
+
 ## Troubleshooting
 
 ### "BLINK_API_KEY environment variable is required"

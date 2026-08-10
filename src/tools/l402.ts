@@ -12,6 +12,13 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import type { BlinkClient } from "../client.js";
+import { assertSafeUrl, SsrfError } from "../security/ssrf.js";
+import { loadSecurityConfig } from "../security/config.js";
+import { enforceAmount, type GuardContext } from "../security/guard.js";
+import { decodeBolt11AmountSats } from "../bolt11.js";
+
+// Re-exported for backwards compatibility (tests and callers import it here).
+export { decodeBolt11AmountSats };
 
 // ── Token store ───────────────────────────────────────────────────────────────
 
@@ -38,8 +45,15 @@ function readStore(): Record<string, TokenEntry> {
 
 function writeStore(store: Record<string, TokenEntry>): void {
   try {
-    fs.mkdirSync(STORE_DIR, { recursive: true });
-    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), "utf8");
+    // Token file holds macaroons + preimages (payment secrets). Restrict to
+    // owner-only, matching the L402 root key handling.
+    fs.mkdirSync(STORE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    // writeFileSync only applies mode on creation; enforce on existing files.
+    fs.chmodSync(STORE_FILE, 0o600);
   } catch (err) {
     throw new Error(`Failed to write token store: ${(err as Error).message}`);
   }
@@ -138,37 +152,6 @@ export function parseL402ProtocolBody(body: unknown): {
   };
 }
 
-export function decodeBolt11AmountSats(invoice: string): number | null {
-  if (!invoice) return null;
-  const lower = invoice.toLowerCase();
-  let amountStr: string;
-  if (lower.startsWith("lntbs")) amountStr = lower.slice(5);
-  else if (lower.startsWith("lntb")) amountStr = lower.slice(4);
-  else if (lower.startsWith("lnbc")) amountStr = lower.slice(4);
-  else return null;
-
-  const match = amountStr.match(/^(\d+)([munp]?)1/);
-  if (!match) return null;
-  const amount = parseInt(match[1], 10);
-  const multiplier = match[2];
-  if (isNaN(amount)) return null;
-
-  const BTC_TO_SAT = 100_000_000;
-  switch (multiplier) {
-    case "":
-      return amount * BTC_TO_SAT;
-    case "m":
-      return Math.round(amount * BTC_TO_SAT * 0.001);
-    case "u":
-      return Math.round(amount * BTC_TO_SAT * 0.000_001);
-    case "n":
-      return Math.round(amount * BTC_TO_SAT * 0.000_000_001);
-    case "p":
-      return Math.round(amount * BTC_TO_SAT * 0.000_000_000_001);
-    default:
-      return null;
-  }
-}
 
 async function fetchWithTimeout(
   url: string,
@@ -186,18 +169,33 @@ async function fetchWithTimeout(
 
 async function resolveCanonicalUrl(
   url: string,
+  allowlist: Set<string>,
   timeoutMs = 10_000,
 ): Promise<string> {
+  await assertSafeUrl(url, allowlist);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    return res.url || url;
-  } catch {
+    // manual redirect handling so each hop is SSRF-checked before we follow it.
+    let current = url;
+    for (let hop = 0; hop < 5; hop++) {
+      const res = await fetch(current, {
+        method: "HEAD",
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      const location = res.headers.get("location");
+      if (res.status >= 300 && res.status < 400 && location) {
+        const next = new URL(location, current).toString();
+        await assertSafeUrl(next, allowlist);
+        current = next;
+        continue;
+      }
+      return current;
+    }
+    return current;
+  } catch (err) {
+    if (err instanceof SsrfError) throw err;
     return url;
   } finally {
     clearTimeout(timer);
@@ -214,8 +212,10 @@ function extractDomain(url: string): string {
 
 async function fetchL402ProtocolInvoice(
   paymentRequestUrl: string,
+  allowlist: Set<string>,
   timeoutMs = 15_000,
 ): Promise<{ invoice: string; offerId: string | null } | null> {
+  await assertSafeUrl(paymentRequestUrl, allowlist);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -251,6 +251,7 @@ interface L402Challenge {
 
 async function resolveL402Challenge(
   res: Response,
+  allowlist: Set<string>,
 ): Promise<L402Challenge | null> {
   const wwwAuth = res.headers.get("www-authenticate") || "";
   const lightningLabs = parseLightningLabsHeader(wwwAuth);
@@ -273,7 +274,10 @@ async function resolveL402Challenge(
   const l402proto = parseL402ProtocolBody(bodyJson);
   if (!l402proto || !l402proto.paymentRequestUrl) return null;
 
-  const fetched = await fetchL402ProtocolInvoice(l402proto.paymentRequestUrl);
+  const fetched = await fetchL402ProtocolInvoice(
+    l402proto.paymentRequestUrl,
+    allowlist,
+  );
   if (!fetched) return null;
 
   return {
@@ -645,6 +649,12 @@ export const l402Tools = {
         .boolean()
         .default(false)
         .describe('For "clear": if true, only remove expired tokens'),
+      reveal: z
+        .boolean()
+        .default(false)
+        .describe(
+          'For "get": if true, return the full unmasked preimage/macaroon (payment secrets). Default false masks them.',
+        ),
     }),
   },
 };
@@ -655,12 +665,28 @@ export async function handleL402Tool(
   client: BlinkClient,
   toolName: string,
   args: Record<string, unknown>,
+  guard?: GuardContext,
 ): Promise<unknown> {
+  const security = loadSecurityConfig();
+  const l402Allowlist = security.l402HostAllowlist;
+
   switch (toolName) {
     case "l402_discover": {
       const { url, method } = args as { url: string; method: string };
 
-      const canonicalUrl = await resolveCanonicalUrl(url);
+      let canonicalUrl: string;
+      try {
+        canonicalUrl = await resolveCanonicalUrl(url, l402Allowlist);
+      } catch (err) {
+        return {
+          success: false,
+          error:
+            err instanceof SsrfError
+              ? `Blocked unsafe URL: ${err.message}`
+              : `Request failed: ${(err as Error).message}`,
+          url,
+        };
+      }
 
       let res: Response;
       try {
@@ -724,7 +750,8 @@ export async function handleL402Tool(
         if (l402proto.paymentRequestUrl) {
           const fetched = await fetchL402ProtocolInvoice(
             l402proto.paymentRequestUrl,
-          );
+            l402Allowlist,
+          ).catch(() => null);
           if (fetched) {
             invoice = fetched.invoice;
             offerId = fetched.offerId;
@@ -770,7 +797,24 @@ export async function handleL402Tool(
           method: string;
         };
 
-      const canonicalUrl = await resolveCanonicalUrl(url);
+      // Enforce a mandatory spend cap: fall back to the configured default
+      // when the caller omits max_amount_sats, so l402_pay can never pay an
+      // unbounded amount.
+      const effectiveMaxSats = max_amount_sats ?? security.l402MaxSats;
+
+      let canonicalUrl: string;
+      try {
+        canonicalUrl = await resolveCanonicalUrl(url, l402Allowlist);
+      } catch (err) {
+        return {
+          success: false,
+          error:
+            err instanceof SsrfError
+              ? `Blocked unsafe URL: ${err.message}`
+              : `Request failed: ${(err as Error).message}`,
+          url,
+        };
+      }
       const domain = extractDomain(canonicalUrl);
 
       // Check token cache first (skip on dry_run or force)
@@ -873,7 +917,19 @@ export async function handleL402Tool(
       }
 
       // Resolve L402 challenge
-      const challenge = await resolveL402Challenge(initialRes);
+      let challenge: L402Challenge | null;
+      try {
+        challenge = await resolveL402Challenge(initialRes, l402Allowlist);
+      } catch (err) {
+        return {
+          success: false,
+          error:
+            err instanceof SsrfError
+              ? `Blocked unsafe URL: ${err.message}`
+              : `Request failed: ${(err as Error).message}`,
+          url,
+        };
+      }
       if (!challenge) {
         return {
           success: false,
@@ -885,21 +941,48 @@ export async function handleL402Tool(
 
       const satoshis = decodeBolt11AmountSats(challenge.invoice);
 
-      // Budget check
-      if (
-        max_amount_sats !== undefined &&
-        satoshis !== null &&
-        satoshis > max_amount_sats
-      ) {
+      // Refuse undecodable amounts: without a known price we cannot enforce a
+      // budget, so we must not pay. (Previously satoshis === null bypassed the
+      // cap entirely.) Dry-run may still report the undecodable state.
+      if (satoshis === null && !dry_run) {
+        return {
+          success: false,
+          event: "l402_amount_undecodable",
+          url,
+          canonicalUrl: canonicalUrl !== url ? canonicalUrl : undefined,
+          message:
+            "Refusing to pay: invoice amount could not be decoded, so the spend cap cannot be enforced.",
+        };
+      }
+
+      // Mandatory L402 cap against the effective cap.
+      if (satoshis !== null && satoshis > effectiveMaxSats) {
         return {
           success: false,
           event: "l402_budget_exceeded",
           url,
           canonicalUrl: canonicalUrl !== url ? canonicalUrl : undefined,
           satoshis,
-          maxAmount: max_amount_sats,
-          message: `Payment of ${satoshis} sats exceeds max_amount_sats of ${max_amount_sats}. Aborting.`,
+          maxAmount: effectiveMaxSats,
+          message: `Payment of ${satoshis} sats exceeds the max of ${effectiveMaxSats} sats (max_amount_sats or BLINK_L402_MAX_SATS). Aborting.`,
         };
+      }
+
+      // Global guard: the discovered amount must also satisfy the shared
+      // BLINK_MAX_PAYMENT_SATS per-tx cap and the rolling 24h budget. This is
+      // the same gate every other spend tool uses; l402_pay is not exempt.
+      if (guard && satoshis !== null && !dry_run) {
+        const gate = enforceAmount(guard, satoshis);
+        if (!gate.ok) {
+          return {
+            success: false,
+            event: "l402_budget_exceeded",
+            url,
+            canonicalUrl: canonicalUrl !== url ? canonicalUrl : undefined,
+            satoshis,
+            message: gate.reason,
+          };
+        }
       }
 
       // Dry run — report price, no payment
@@ -913,13 +996,12 @@ export async function handleL402Tool(
           invoice: challenge.invoice,
           satoshis,
           satoshisFormatted: satoshis !== null ? `${satoshis} sats` : null,
-          maxAmount: max_amount_sats ?? null,
-          withinBudget:
-            max_amount_sats !== undefined && satoshis !== null
-              ? satoshis <= max_amount_sats
-              : null,
+          maxAmount: effectiveMaxSats,
+          withinBudget: satoshis !== null ? satoshis <= effectiveMaxSats : null,
           message:
-            "Dry-run: would pay this invoice to access the resource. No payment made.",
+            satoshis === null
+              ? "Dry-run: invoice amount is undecodable; a real l402_pay would REFUSE to pay it."
+              : "Dry-run: would pay this invoice to access the resource. No payment made.",
           ...(challenge.offers ? { offers: challenge.offers } : {}),
         };
       }
@@ -949,6 +1031,12 @@ export async function handleL402Tool(
           error: `Payment not successful: status=${payResponse.status}`,
           url,
         };
+      }
+
+      // Debit the durable 24h budget only on a real, successful payment
+      // (status SUCCESS pays; ALREADY_PAID moved no new funds).
+      if (guard && satoshis !== null && payResponse.status === "SUCCESS") {
+        guard.ledger.record(satoshis);
       }
 
       // Extract preimage
@@ -1255,10 +1343,11 @@ export async function handleL402Tool(
     }
 
     case "l402_store": {
-      const { command, domain, expired_only } = args as {
+      const { command, domain, expired_only, reveal } = args as {
         command: string;
         domain?: string;
         expired_only: boolean;
+        reveal: boolean;
       };
 
       if (command === "list") {
@@ -1285,11 +1374,20 @@ export async function handleL402Tool(
             message: `No valid token found for domain: ${domain}`,
           };
         }
+        // Payment secrets are masked by default to keep them out of model
+        // context; pass reveal:true to opt in to the full values.
+        const maskedMacaroon = entry.macaroon
+          ? entry.macaroon.slice(0, 12) + "…" + entry.macaroon.slice(-6)
+          : null;
+        const maskedPreimage = entry.preimage
+          ? entry.preimage.slice(0, 8) + "…"
+          : null;
         return {
           domain,
           found: true,
-          macaroon: entry.macaroon,
-          preimage: entry.preimage,
+          revealed: reveal === true,
+          macaroon: reveal ? entry.macaroon : maskedMacaroon,
+          preimage: reveal ? entry.preimage : maskedPreimage,
           satoshis: entry.satoshis ?? null,
           savedAt: entry.savedAt ? new Date(entry.savedAt).toISOString() : null,
           expiresAt: entry.expiresAt
