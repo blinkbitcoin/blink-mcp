@@ -22,31 +22,36 @@ import {
   parseLightningLabsHeader,
   parseL402ProtocolBody,
   decodeBolt11AmountSats,
-  saveToken,
-  getToken,
-  listTokens,
-  clearTokens,
   l402Tools,
 } from "../src/tools/l402.js";
 
 // ── Token store tests (isolated to temp dir) ───────────────────────────────────
 
-// We monkey-patch the STORE_FILE path by writing directly to a temp dir.
-// Since l402.ts uses os.homedir() at module load, we override HOME.
+// l402.ts fixes the token store path from os.homedir() at module load, and a
+// static import is evaluated before any before() hook runs. So point
+// os.homedir() at a temp dir first, then load a fresh module instance for the
+// token-store functions; otherwise these tests would read, overwrite and clear
+// the developer's real ~/.blink/l402-tokens.json.
 
-let originalHome: string;
+type L402Module = typeof import("../src/tools/l402.js");
+let saveToken: L402Module["saveToken"];
+let getToken: L402Module["getToken"];
+let listTokens: L402Module["listTokens"];
+let clearTokens: L402Module["clearTokens"];
+
+let originalHomedir: typeof os.homedir;
 let tempHome: string;
 
-before(() => {
-  originalHome = os.homedir();
+before(async () => {
+  originalHomedir = os.homedir;
   tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "blink-mcp-l402-test-"));
-  // Override homedir for this test run
-  // Node's os.homedir() reads HOME env var on Linux.
-  process.env.HOME = tempHome;
+  (os as unknown as { homedir: () => string }).homedir = () => tempHome;
+  const mod: L402Module = await import("../src/tools/l402.ts?store-test");
+  ({ saveToken, getToken, listTokens, clearTokens } = mod);
 });
 
 after(() => {
-  process.env.HOME = originalHome;
+  (os as unknown as { homedir: typeof os.homedir }).homedir = originalHomedir;
   fs.rmSync(tempHome, { recursive: true, force: true });
 });
 
