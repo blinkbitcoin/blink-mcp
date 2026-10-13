@@ -4,6 +4,7 @@
 
 import { describe, test, afterEach, before } from "node:test";
 import assert from "node:assert/strict";
+import dns from "node:dns/promises";
 
 import { ipIsPrivate, safeFetch, assertSafeUrl, SsrfError } from "../src/security/ssrf.ts";
 
@@ -261,5 +262,72 @@ describe("L402 requests re-validate redirects", () => {
     assert.equal(result.invoice, null);
     assert.equal(internalBodyRead, false);
     assert.ok(!calls.some((c) => c.includes("127.0.0.1")));
+  });
+});
+
+// ── remaining ssrf branches ───────────────────────────────────────────────
+
+describe("ipIsPrivate: more shapes", () => {
+  test("full-form addresses and colon-bearing garbage", () => {
+    assert.equal(ipIsPrivate("fe80:0:0:0:0:0:0:1"), true);
+    assert.equal(ipIsPrivate("2606:4700:0:0:0:0:0:1111"), false);
+    assert.equal(ipIsPrivate("foo:bar"), true);
+  });
+});
+
+describe("assertSafeUrl: parsing and DNS", () => {
+  const allow = new Set(["api.example.com"]);
+
+  test("rejects a malformed URL", async () => {
+    await assert.rejects(() => assertSafeUrl("not a url", allow), /Invalid URL/);
+  });
+
+  test("accepts a host that resolves only to public addresses", async (t) => {
+    t.mock.method(dns, "lookup", async () => [{ address: "8.8.8.8", family: 4 }, { address: "2606:4700::1111", family: 6 }]);
+    await assert.doesNotReject(() => assertSafeUrl("https://api.example.com/x", allow));
+  });
+
+  test("rejects a host with any private address", async (t) => {
+    t.mock.method(dns, "lookup", async () => [{ address: "8.8.8.8", family: 4 }, { address: "10.0.0.5", family: 4 }]);
+    await assert.rejects(() => assertSafeUrl("https://api.example.com/x", allow), /non-public address 10\.0\.0\.5/);
+  });
+
+  test("rejects unresolvable hosts and empty answers", async (t) => {
+    const lookup = t.mock.method(dns, "lookup", async () => {
+      throw new Error("ENOTFOUND");
+    });
+    await assert.rejects(() => assertSafeUrl("https://api.example.com/x", allow), /Could not resolve/);
+    lookup.mock.mockImplementation(async () => []);
+    await assert.rejects(() => assertSafeUrl("https://api.example.com/x", allow), /no addresses/);
+  });
+});
+
+describe("safeFetch: redirect bodies", () => {
+  let origFetch: typeof globalThis.fetch;
+  before(() => {
+    origFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+  });
+
+  test("discards a redirect's body before following it", async () => {
+    let cancelled = false;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      if (input.toString() === "https://8.8.8.8/a") {
+        const body = new ReadableStream({ cancel: () => void (cancelled = true) });
+        return new Response(body, { status: 302, headers: { location: "/b" } });
+      }
+      return new Response("done", { status: 200 });
+    }) as typeof fetch;
+    const res = await safeFetch("https://8.8.8.8/a", {}, { allowlist: ALLOW });
+    assert.equal(await res.text(), "done");
+    assert.equal(cancelled, true);
+  });
+
+  test("a 3xx without Location is returned as-is", async () => {
+    globalThis.fetch = (async () => new Response(null, { status: 304 })) as typeof fetch;
+    const res = await safeFetch("https://8.8.8.8/a", {}, { allowlist: ALLOW });
+    assert.equal(res.status, 304);
   });
 });

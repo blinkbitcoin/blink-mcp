@@ -53,17 +53,19 @@ const blocked = new net.BlockList();
 for (const [addr, prefix] of V4_BLOCKED) blocked.addSubnet(addr, prefix, "ipv4");
 for (const [addr, prefix] of V6_BLOCKED) blocked.addSubnet(addr, prefix, "ipv6");
 
+// Callers pass only addresses net.isIP() has already classified as IPv4.
 function ipv4IsPrivate(ip: string): boolean {
-  if (!net.isIPv4(ip)) return true;
   return blocked.check(ip, "ipv4");
 }
 
-/** Expand an IPv6 address into its eight 16-bit groups, or null if invalid. */
-function expandIpv6(ip: string): number[] | null {
+/**
+ * Expand an IPv6 address (already validated by net.isIP) into its eight 16-bit
+ * groups. A zone suffix ("%eth0") is ignored.
+ */
+function expandIpv6(ip: string): number[] {
   let addr = ip.toLowerCase();
   const zone = addr.indexOf("%");
   if (zone !== -1) addr = addr.slice(0, zone);
-  if (!net.isIPv6(addr)) return null;
 
   // Replace a trailing dotted IPv4 with two hex groups.
   const dotted = addr.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
@@ -76,14 +78,13 @@ function expandIpv6(ip: string): number[] | null {
       ((o[2] << 8) | o[3]).toString(16);
   }
 
-  const [head, tail] = addr.includes("::") ? addr.split("::") : [addr, null];
   const parse = (part: string): number[] =>
     part === "" ? [] : part.split(":").map((h) => parseInt(h, 16));
+  if (!addr.includes("::")) return parse(addr);
+  const [head, tail] = addr.split("::");
   const headGroups = parse(head);
-  if (tail === null) return headGroups.length === 8 ? headGroups : null;
   const tailGroups = parse(tail);
   const fill = 8 - headGroups.length - tailGroups.length;
-  if (fill < 1) return null;
   return [...headGroups, ...new Array<number>(fill).fill(0), ...tailGroups];
 }
 
@@ -115,7 +116,6 @@ function embeddedIpv4(g: number[]): string | null {
 
 function ipv6IsPrivate(ip: string): boolean {
   const groups = expandIpv6(ip);
-  if (!groups) return true; // unparseable → unsafe
   const canonical = groups.map((x) => x.toString(16)).join(":");
   if (blocked.check(canonical, "ipv6")) return true;
   const v4 = embeddedIpv4(groups);
@@ -127,8 +127,6 @@ export function ipIsPrivate(ip: string): boolean {
   const type = net.isIP(ip);
   if (type === 4) return ipv4IsPrivate(ip);
   if (type === 6) return ipv6IsPrivate(ip);
-  // Zone-scoped IPv6 (fe80::1%eth0) fails net.isIP; it is never public.
-  if (ip.includes(":")) return ipv6IsPrivate(ip);
   return true; // not a recognizable IP → treat as unsafe
 }
 

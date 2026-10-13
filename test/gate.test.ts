@@ -18,6 +18,9 @@ import {
   extractSpendIntent,
   evaluateSpend,
   describeSpend,
+  reserveSpend,
+  enforceAmount,
+  evaluateWebhook,
   type GuardContext,
 } from "../src/security/guard.ts";
 import { runGuarded, type GateDeps } from "../src/security/gate.ts";
@@ -384,5 +387,191 @@ describe("SpendLedger hardening", () => {
     const results = await Promise.all([run(), run(), run(), run()]);
     assert.equal(results.reduce((x, y) => x + y, 0), 10);
     assert.equal(new SpendLedger(file).spentLast24h(), 1000);
+  });
+});
+
+// ── remaining gate / guard branches ───────────────────────────────────────
+
+describe("runGuarded: spend paths", () => {
+  const a = { amount: 400, recipient_wallet_id: "w2", wallet_id: "w1" };
+
+  test("spends are confirmed with the payment prompt", async () => {
+    const kinds: string[] = [];
+    const c = ctx();
+    const { deps } = gateDeps(c, {
+      elicit: async (_s, kind) => {
+        kinds.push(kind);
+        return true;
+      },
+    });
+    const res = await runGuarded("send_to_wallet", a, a, deps, executor().run);
+    assert.equal(res.isError, undefined);
+    assert.deepEqual(kinds, ["payment"]);
+    assert.equal(c.ledger.spentLast24h(), 400);
+  });
+
+  test("l402_pay is confirmed but reserves inside its handler, not the gate", async () => {
+    const c = ctx();
+    const { deps } = gateDeps(c, { elicit: async () => true });
+    const exec = executor();
+    const args = { url: "https://x", wallet_id: "w" };
+    await runGuarded("l402_pay", args, args, deps, exec.run);
+    assert.equal(exec.calls.n, 1);
+    assert.equal(c.ledger.spentLast24h(), 0);
+  });
+
+  test("a spend that lands during confirmation can push the reservation over budget", async () => {
+    const c = ctx({ dailyBudgetSats: 1000 });
+    const { deps } = gateDeps(c, {
+      elicit: async () => {
+        c.ledger.record(900); // concurrent spend while the human decides
+        return true;
+      },
+    });
+    const exec = executor();
+    const res = await runGuarded("send_to_wallet", a, a, deps, exec.run);
+    assert.equal(res.isError, true);
+    assert.match(String(parse(res).error), /already spent 900/);
+    assert.equal(exec.calls.n, 0);
+  });
+});
+
+describe("guard helpers: edge cases", () => {
+  test("non-numeric amounts, missing invoices and unknown tools have no amount", () => {
+    assert.equal(extractSpendIntent("send_onchain", { amount: "5" }).amount, null);
+    const inv = extractSpendIntent("pay_invoice", {});
+    assert.equal(inv.amount, null);
+    assert.equal(inv.undecodable, true);
+    assert.deepEqual(extractSpendIntent("get_balance", {}), { amount: null, recipient: null, isSweep: false });
+  });
+
+  test("allowlist with no resolvable recipient is denied", async () => {
+    const c = ctx({ recipientAllowlist: new Set(["a@b.c"]) });
+    const d = await evaluateSpend(c, "send_onchain", { amount: 1, recipient: null, isSweep: false });
+    assert.equal(d.action, "deny");
+  });
+
+  test("a USD amount with no converter is denied when a cap is set", async () => {
+    const c = ctx({ maxPaymentSats: 1000 });
+    const d = await evaluateSpend(c, "send_onchain_usd", { amount: 1, currency: "USD", recipient: "bc1q", isSweep: false });
+    assert.equal(d.action, "deny");
+  });
+
+  test("an unreadable ledger blocks enforceAmount when a budget is set", () => {
+    const c = ctx({ dailyBudgetSats: 1000 });
+    (c.ledger as unknown as { spentLast24h: () => number }).spentLast24h = () => {
+      throw new Error("lock timeout");
+    };
+    const r = enforceAmount(c, 1);
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /Spend ledger unavailable \(lock timeout\)/);
+  });
+
+  test("reserveSpend: over budget, ledger failure with and without a budget", () => {
+    const over = ctx({ dailyBudgetSats: 100 });
+    assert.equal(reserveSpend(over, 200).ok, false);
+
+    const broken = (budget: number | null) => {
+      const c = ctx({ dailyBudgetSats: budget });
+      (c.ledger as unknown as { reserve: () => never }).reserve = () => {
+        throw new Error("disk full");
+      };
+      return c;
+    };
+    const denied = reserveSpend(broken(1000), 10);
+    assert.equal(denied.ok, false);
+    assert.match((denied as { reason: string }).reason, /disk full/);
+
+    const warnings: string[] = [];
+    const allowed = reserveSpend(broken(null), 10, (l) => warnings.push(l));
+    assert.equal(allowed.ok, true);
+    if (allowed.ok) {
+      allowed.commit();
+      allowed.release();
+    }
+    assert.match(warnings[0], /\[spend-ledger\] disk full/);
+    assert.equal(reserveSpend(broken(null), 10).ok, true); // default warn is a no-op
+  });
+
+  test("evaluateWebhook: missing URL is denied; confirmation off allows", () => {
+    const d = evaluateWebhook(ctx(), "add_webhook", {});
+    assert.equal(d.action, "deny");
+    assert.match((d as { reason: string }).reason, /Invalid webhook URL/);
+    const off = evaluateWebhook(ctx({ requireConfirmation: false }), "remove_webhook", { id: "x" });
+    assert.deepEqual(off, { action: "allow", amountSats: null });
+  });
+
+  test("describeSpend covers unknown amounts, sweeps and missing recipients", () => {
+    assert.match(
+      describeSpend("l402_pay", { amount: null, recipient: null, isSweep: false }),
+      /an amount determined during execution to an unspecified recipient/,
+    );
+    assert.match(describeSpend("send_onchain_all", { amount: null, recipient: "bc1q", isSweep: true }), /ENTIRE WALLET/);
+    assert.match(
+      describeSpend("send_onchain_usd", { amount: 5, currency: "USD", recipient: "bc1q", isSweep: false }),
+      /5 USD cents to/,
+    );
+  });
+
+  test("pay_invoice_with_amount carries its amount as sats", () => {
+    const i = extractSpendIntent("pay_invoice_with_amount", { amount: 21, payment_request: "lnbc1p" });
+    assert.deepEqual(i, { amount: 21, recipient: "lnbc1p", isSweep: false });
+  });
+
+  test("a code that expires between pruning and checking is refused", () => {
+    // Each clock read advances time, so the entry survives prune() but is
+    // expired by the time consume() checks it.
+    let now = 0;
+    const store = new ApprovalCodeStore(() => now);
+    const code = store.issue("t", "h");
+    const reads = [5 * 60 * 1000 - 1, 5 * 60 * 1000];
+    (store as unknown as { now: () => number }).now = () => reads.shift() ?? now;
+    assert.equal(store.consume(code, "t", "h"), false);
+  });
+
+  test("approval codes expire and must match in length", () => {
+    let now = 0;
+    const store = new ApprovalCodeStore(() => now);
+    const code = store.issue("t", "h");
+    assert.equal(store.consume(code.slice(1), "t", "h"), false); // wrong length, and single-use
+    const code2 = store.issue("t", "h");
+    store.issue("t", "other");
+    now += 6 * 60 * 1000; // past the 5-minute TTL; prune drops both
+    assert.equal(store.consume(code2, "t", "h"), false);
+  });
+});
+
+describe("SpendLedger: unreadable and unwritable files", () => {
+  test("malformed records are rejected", () => {
+    for (const bad of [[null], [{ at: "x", amount: 1 }], [{ at: 1, amount: "1" }], [{ at: 1, amount: null }]]) {
+      const file = tmpLedgerFile();
+      fs.writeFileSync(file, JSON.stringify(bad));
+      assert.throws(() => new SpendLedger(file).spentLast24h(), /malformed record/);
+    }
+  });
+
+  test("a read error other than ENOENT is treated as corrupt", () => {
+    const file = tmpLedgerFile();
+    fs.mkdirSync(file); // a directory where the file should be → EISDIR
+    assert.throws(() => new SpendLedger(file).spentLast24h(), LedgerCorruptError);
+  });
+
+  test("a failed write cleans up its temp file and propagates", (t) => {
+    const file = tmpLedgerFile();
+    t.mock.method(fs, "renameSync", () => {
+      throw new Error("EXDEV");
+    });
+    assert.throws(() => new SpendLedger(file).record(1), /EXDEV/);
+    assert.deepEqual(fs.readdirSync(path.dirname(file)), []);
+  });
+});
+
+describe("loadSecurityConfig: boolean parsing", () => {
+  test("accepts truthy spellings and rejects nonsense", () => {
+    assert.equal(loadSecurityConfig({ BLINK_REQUIRE_CONFIRMATION: "Yes" } as NodeJS.ProcessEnv).requireConfirmation, true);
+    assert.throws(
+      () => loadSecurityConfig({ BLINK_REQUIRE_CONFIRMATION: "maybe" } as NodeJS.ProcessEnv),
+      /Invalid boolean security setting/,
+    );
   });
 });
