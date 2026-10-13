@@ -14,7 +14,7 @@ import crypto from "node:crypto";
 import type { BlinkClient } from "../client.js";
 import { assertSafeUrl, safeFetch, SsrfError } from "../security/ssrf.js";
 import { loadSecurityConfig } from "../security/config.js";
-import { enforceAmount, type GuardContext } from "../security/guard.js";
+import { enforceAmount, reserveSpend, type GuardContext } from "../security/guard.js";
 import { decodeBolt11AmountSats } from "../bolt11.js";
 
 // Re-exported for backwards compatibility (tests and callers import it here).
@@ -1008,13 +1008,41 @@ export async function handleL402Tool(
         };
       }
 
-      // Pay the invoice
-      const payResult = await client.payLnInvoice({
-        walletId: wallet_id,
-        paymentRequest: challenge.invoice,
-      });
+      // Reserve the decoded amount against the 24h budget atomically, right
+      // before paying, so concurrent spends cannot both pass the check above.
+      const reservation =
+        guard && satoshis !== null ? reserveSpend(guard, satoshis, console.error) : null;
+      if (reservation && !reservation.ok) {
+        return {
+          success: false,
+          event: "l402_budget_exceeded",
+          url,
+          canonicalUrl: canonicalUrl !== url ? canonicalUrl : undefined,
+          satoshis,
+          message: reservation.reason,
+        };
+      }
 
-      const payResponse = payResult.lnInvoicePaymentSend;
+      // Pay the invoice. The reservation is committed only on a real,
+      // successful payment (status SUCCESS pays; ALREADY_PAID moved no new
+      // funds) and released otherwise.
+      let paid = false;
+      let payResponse: Awaited<ReturnType<BlinkClient["payLnInvoice"]>>["lnInvoicePaymentSend"];
+      try {
+        const payResult = await client.payLnInvoice({
+          walletId: wallet_id,
+          paymentRequest: challenge.invoice,
+        });
+        payResponse = payResult.lnInvoicePaymentSend;
+        paid =
+          !(payResponse.errors && (payResponse.errors as unknown[]).length > 0) &&
+          payResponse.status === "SUCCESS";
+      } finally {
+        if (reservation?.ok) {
+          if (paid) reservation.commit();
+          else reservation.release();
+        }
+      }
 
       if (payResponse.errors && (payResponse.errors as unknown[]).length > 0) {
         return {
@@ -1033,12 +1061,6 @@ export async function handleL402Tool(
           error: `Payment not successful: status=${payResponse.status}`,
           url,
         };
-      }
-
-      // Debit the durable 24h budget only on a real, successful payment
-      // (status SUCCESS pays; ALREADY_PAID moved no new funds).
-      if (guard && satoshis !== null && payResponse.status === "SUCCESS") {
-        guard.ledger.record(satoshis);
       }
 
       // Extract preimage
