@@ -315,14 +315,16 @@ are enforced for every spend tool. Fixed-amount Lightning invoices are decoded
 from the bolt11 before payment so `pay_invoice` is subject to the same caps and
 budget as amount-carrying tools. USD-wallet amounts (`send_onchain_usd`,
 `send_to_wallet_usd`, `send_to_username` with `wallet_currency: "USD"`) are in
-cents; they are converted to sats at Blink's current rate before being checked
-against the sat-denominated caps, and refused if the conversion fails while a
-cap is configured. For `l402_pay`, whose amount is only known after fetching the
+cents; when a cap or budget is configured they are converted to sats at Blink's
+current rate before being checked against it, and refused if the conversion
+fails. For `l402_pay`, whose amount is only known after fetching the
 invoice, the caps are re-checked *after decoding* and before payment.
 
-The 24h budget is reserved atomically right before a payment executes and kept
-only if the payment **succeeds** (failed attempts never burn budget), so
-concurrent calls cannot overspend it. It is persisted to a `0600` ledger at
+The 24h budget is reserved atomically right before a payment executes, so
+concurrent calls cannot overspend it. The reservation is released when the
+payment definitely **fails** (failed attempts never burn budget) and kept when it
+succeeds — or when the outcome is unknown (e.g. a timeout), since the funds may
+have moved. It is persisted to a `0600` ledger at
 `~/.blink/spend-ledger.json` so it survives restarts; the ledger is locked
 against concurrent server processes, written atomically, and if it becomes
 unreadable spends are refused (while a budget is configured) rather than the

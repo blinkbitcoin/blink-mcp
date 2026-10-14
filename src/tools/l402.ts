@@ -14,7 +14,12 @@ import crypto from "node:crypto";
 import type { BlinkClient } from "../client.js";
 import { assertSafeUrl, safeFetch, SsrfError } from "../security/ssrf.js";
 import { loadSecurityConfig } from "../security/config.js";
-import { enforceAmount, reserveSpend, type GuardContext } from "../security/guard.js";
+import {
+  enforceAmount,
+  reserveSpend,
+  settleReservation,
+  type GuardContext,
+} from "../security/guard.js";
 import { decodeBolt11AmountSats } from "../bolt11.js";
 
 // Re-exported for backwards compatibility (tests and callers import it here).
@@ -223,7 +228,9 @@ async function fetchL402ProtocolInvoice(
     return invoice
       ? { invoice, offerId: (data.offer_id as string | null) || null }
       : null;
-  } catch {
+  } catch (err) {
+    // A blocked hop must surface as such, not as an unparseable challenge.
+    if (err instanceof SsrfError) throw err;
     return null;
   }
 }
@@ -677,14 +684,7 @@ export async function handleL402Tool(
       try {
         canonicalUrl = await resolveCanonicalUrl(url, l402Allowlist);
       } catch (err) {
-        return {
-          success: false,
-          error:
-            err instanceof SsrfError
-              ? `Blocked unsafe URL: ${err.message}`
-              : `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
 
       let res: Response;
@@ -802,14 +802,7 @@ export async function handleL402Tool(
       try {
         canonicalUrl = await resolveCanonicalUrl(url, l402Allowlist);
       } catch (err) {
-        return {
-          success: false,
-          error:
-            err instanceof SsrfError
-              ? `Blocked unsafe URL: ${err.message}`
-              : `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
       const domain = extractDomain(canonicalUrl);
 
@@ -923,14 +916,7 @@ export async function handleL402Tool(
       try {
         challenge = await resolveL402Challenge(initialRes, l402Allowlist);
       } catch (err) {
-        return {
-          success: false,
-          error:
-            err instanceof SsrfError
-              ? `Blocked unsafe URL: ${err.message}`
-              : `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
       if (!challenge) {
         return {
@@ -1011,7 +997,7 @@ export async function handleL402Tool(
       // Reserve the decoded amount against the 24h budget atomically, right
       // before paying, so concurrent spends cannot both pass the check above.
       const reservation =
-        guard && satoshis !== null ? reserveSpend(guard, satoshis, console.error) : null;
+        guard && satoshis !== null ? await reserveSpend(guard, satoshis, console.error) : null;
       if (reservation && !reservation.ok) {
         return {
           success: false,
@@ -1025,23 +1011,18 @@ export async function handleL402Tool(
 
       // Pay the invoice. The reservation is committed only on a real,
       // successful payment (status SUCCESS pays; ALREADY_PAID moved no new
-      // funds) and released otherwise.
-      let paid = false;
-      let payResponse: Awaited<ReturnType<BlinkClient["payLnInvoice"]>>["lnInvoicePaymentSend"];
-      try {
-        const payResult = await client.payLnInvoice({
-          walletId: wallet_id,
-          paymentRequest: challenge.invoice,
-        });
-        payResponse = payResult.lnInvoicePaymentSend;
-        paid =
+      // funds) and released on a definite failure. If the call throws, the
+      // outcome is unknown, so the reservation stays pending and keeps counting.
+      const payResult = await client.payLnInvoice({
+        walletId: wallet_id,
+        paymentRequest: challenge.invoice,
+      });
+      const payResponse = payResult.lnInvoicePaymentSend;
+      if (reservation?.ok) {
+        const paid =
           !(payResponse.errors && (payResponse.errors as unknown[]).length > 0) &&
           payResponse.status === "SUCCESS";
-      } finally {
-        if (reservation?.ok) {
-          if (paid) reservation.commit();
-          else reservation.release();
-        }
+        await settleReservation(paid ? reservation.commit : reservation.release, console.error);
       }
 
       if (payResponse.errors && (payResponse.errors as unknown[]).length > 0) {

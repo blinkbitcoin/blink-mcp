@@ -12,6 +12,7 @@ import {
   evaluateWebhook,
   confirmSpend,
   reserveSpend,
+  settleReservation,
   type ApprovalCodeStore,
   type GuardContext,
   type GuardDecision,
@@ -105,22 +106,21 @@ export async function runGuarded(
     // approved → fall through to execution
   }
 
-  // Known-amount spends reserve their sats right before executing. l402_pay
-  // reserves its own decoded amount inside the handler; sweeps and webhook
-  // tools have no amount to reserve.
-  const amountSats = name === "l402_pay" ? null : decision.amountSats;
+  // Known-amount spends reserve their sats right before executing. Sweeps,
+  // webhook tools and l402_pay (which reserves its decoded amount inside the
+  // handler) carry no up-front amount.
+  const amountSats = decision.amountSats;
   if (amountSats === null) return jsonResponse(await execute());
 
-  const reservation = reserveSpend(deps.guardCtx, amountSats, deps.printToStderr);
+  const reservation = await reserveSpend(deps.guardCtx, amountSats, deps.printToStderr);
   if (!reservation.ok) return errorResponse(reservation.reason);
 
-  let succeeded = false;
-  try {
-    const result = await execute();
-    succeeded = isSuccessfulSpend(result);
-    return jsonResponse(result);
-  } finally {
-    if (succeeded) reservation.commit();
-    else reservation.release();
-  }
+  // If execute() throws, the payment may still have gone through (e.g. a
+  // client-side timeout), so the reservation is deliberately left pending.
+  const result = await execute();
+  await settleReservation(
+    isSuccessfulSpend(result) ? reservation.commit : reservation.release,
+    deps.printToStderr,
+  );
+  return jsonResponse(result);
 }

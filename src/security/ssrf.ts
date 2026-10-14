@@ -99,8 +99,12 @@ function v4FromGroups(hi: number, lo: number): string {
 function embeddedIpv4(g: number[]): string | null {
   const zero = (from: number, to: number) =>
     g.slice(from, to).every((x) => x === 0);
-  // ::ffff:a.b.c.d (IPv4-mapped) and ::a.b.c.d (IPv4-compatible, deprecated)
-  if (zero(0, 5) && (g[5] === 0xffff || g[5] === 0)) {
+  // ::ffff:a.b.c.d (IPv4-mapped), ::a.b.c.d (IPv4-compatible, deprecated) and
+  // ::ffff:0:a.b.c.d (IPv4-translated, RFC 2765 SIIT)
+  if (
+    zero(0, 4) &&
+    ((g[4] === 0 && (g[5] === 0xffff || g[5] === 0)) || (g[4] === 0xffff && g[5] === 0))
+  ) {
     return v4FromGroups(g[6], g[7]);
   }
   // 64:ff9b::a.b.c.d (well-known NAT64 prefix)

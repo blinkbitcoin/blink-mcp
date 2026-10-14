@@ -295,24 +295,26 @@ function ledgerFailureReason(err: unknown): string {
 }
 
 export type Reserved =
-  | { ok: true; commit: () => void; release: () => void }
+  | { ok: true; commit: () => Promise<void>; release: () => Promise<void> }
   | { ok: false; reason: string };
 
 /**
  * Atomically check the 24h budget and reserve `amountSats` in the ledger right
  * before a payment executes, so concurrent spends cannot both pass a stale
  * budget check. The caller must commit() on a successful payment and release()
- * otherwise. With no budget configured, ledger failures do not block the spend
- * (the ledger is then informational only) and are reported via `warn`.
+ * on a definite failure; when the outcome is unknown (the payment call threw)
+ * it should do neither, so the pending entry keeps counting. With no budget
+ * configured, ledger failures do not block the spend (the ledger is then
+ * informational only) and are reported via `warn`.
  */
-export function reserveSpend(
+export async function reserveSpend(
   ctx: GuardContext,
   amountSats: number,
   warn: (line: string) => void = () => {},
-): Reserved {
+): Promise<Reserved> {
   const budget = ctx.config.dailyBudgetSats;
   try {
-    const res = ctx.ledger.reserve(amountSats, budget);
+    const res = await ctx.ledger.reserve(amountSats, budget);
     if (!res.ok) {
       return { ok: false, reason: budgetExceededReason(amountSats, budget as number, res.spent) };
     }
@@ -324,22 +326,41 @@ export function reserveSpend(
   } catch (err) {
     if (budget !== null) return { ok: false, reason: ledgerFailureReason(err) };
     warn(`[spend-ledger] ${(err as Error).message}`);
-    return { ok: true, commit: () => {}, release: () => {} };
+    return { ok: true, commit: async () => {}, release: async () => {} };
+  }
+}
+
+/**
+ * Settle a reservation after the payment has run. A ledger failure here must
+ * not turn a completed payment into a reported error (the caller could retry
+ * and pay twice), so it is only logged; the entry stays pending and keeps
+ * counting toward the budget, which errs on the safe side.
+ */
+export async function settleReservation(
+  settle: () => Promise<void>,
+  warn: (line: string) => void,
+): Promise<void> {
+  try {
+    await settle();
+  } catch (err) {
+    warn(`[spend-ledger] could not settle reservation: ${(err as Error).message}`);
   }
 }
 
 /**
  * Resolve an intent's amount in sats. BTC amounts pass through; USD cents are
- * converted via ctx.toSats (rounded up). Returns null when the amount is
- * unknown or the conversion is unavailable.
+ * converted via ctx.toSats (rounded up) — but only when a cap or budget needs
+ * the sats figure, to avoid a price lookup on every USD spend by default.
+ * Returns null when the amount is unknown or not converted.
  */
 async function amountInSats(
   ctx: GuardContext,
   intent: SpendIntent,
+  capsConfigured: boolean,
 ): Promise<number | null> {
   if (intent.amount === null) return null;
   if ((intent.currency ?? "BTC") === "BTC") return intent.amount;
-  if (!ctx.toSats) return null;
+  if (!capsConfigured || !ctx.toSats) return null;
   try {
     const sats = await ctx.toSats(intent.amount);
     return Number.isFinite(sats) && sats >= 0 ? Math.ceil(sats) : null;
@@ -382,7 +403,7 @@ export async function evaluateSpend(
   const capsConfigured =
     config.maxPaymentSats !== null || config.dailyBudgetSats !== null;
 
-  const amountSats = await amountInSats(ctx, intent);
+  const amountSats = await amountInSats(ctx, intent, capsConfigured);
 
   if (amountSats !== null) {
     // Amount known up front → enforce the cap/budget now (in sats).
@@ -582,7 +603,7 @@ export async function confirmSpend(
     if (approved) return { status: "approved" };
     return {
       status: "rejected",
-      reason: "Payment was not approved by the user.",
+      reason: "The request was not approved by the user.",
     };
   }
 
@@ -590,7 +611,7 @@ export async function confirmSpend(
     return {
       status: "rejected",
       reason:
-        "This MCP client cannot obtain human approval (no elicitation support), and BLINK_APPROVAL_MODE is fail-closed. Refusing the payment. Use an elicitation-capable client, or set BLINK_APPROVAL_MODE=stderr-code to approve via the server console.",
+        "This MCP client cannot obtain human approval (no elicitation support), and BLINK_APPROVAL_MODE is fail-closed. Refusing. Use an elicitation-capable client, or set BLINK_APPROVAL_MODE=stderr-code to approve via the server console.",
     };
   }
 

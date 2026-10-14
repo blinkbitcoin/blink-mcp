@@ -346,7 +346,7 @@ describe("l402_pay", () => {
     const g = guard({ dailyBudgetSats: 5000 });
     // Simulate a concurrent spend landing between the cap check and the
     // payment: the budget check passes, the atomic reservation does not.
-    (g.ledger as unknown as { reserve: () => unknown }).reserve = () => ({ ok: false, spent: 4500 });
+    (g.ledger as unknown as { reserve: () => unknown }).reserve = async () => ({ ok: false, spent: 4500 });
     const { client, calls } = fakeClient();
     const r = await pay(client, g);
     assert.equal(r.event, "l402_budget_exceeded");
@@ -381,11 +381,37 @@ describe("l402_pay", () => {
     assert.equal(g.ledger.spentLast24h(), 0);
   });
 
-  test("a throwing payment call releases the reservation", async () => {
+  test("a throwing payment call keeps the reservation pending (outcome unknown)", async () => {
     route({ [`GET ${ORIGIN}/res`]: challenge402 });
     const g = guard({ dailyBudgetSats: 5000 });
     await assert.rejects(() => pay(fakeClient("SUCCESS", { throws: true }).client, g), /blink api down/);
-    assert.equal(g.ledger.spentLast24h(), 0);
+    assert.equal(g.ledger.spentLast24h(), 1000);
+  });
+
+  test("a ledger failure after paying does not fail the paid request", async () => {
+    route({
+      [`GET ${ORIGIN}/res`]: challenge402,
+      [`GET ${ORIGIN}/res auth`]: json(200, {}),
+    });
+    const g = guard({ dailyBudgetSats: 5000 });
+    (g.ledger as unknown as { commit: () => Promise<never> }).commit = async () => {
+      throw new Error("lock timeout");
+    };
+    const r = await pay(fakeClient().client, g);
+    assert.equal(r.success, true);
+    assert.equal(g.ledger.spentLast24h(), 1000);
+  });
+
+  test("an l402-protocol invoice URL redirected to an internal host is reported as blocked", async () => {
+    const seen = route({
+      [`GET ${ORIGIN}/res`]: json(402, { payment_request_url: `${ORIGIN}/pay` }),
+      [`POST ${ORIGIN}/pay`]: redirectTo("https://169.254.169.254/latest", 307),
+    });
+    const { client, calls } = fakeClient();
+    const r = await pay(client, guard({ dailyBudgetSats: 5000 }));
+    assert.match(String(r.error), /Blocked unsafe URL/);
+    assert.equal(calls.pay, 0);
+    assert.ok(!seen.some((x) => x.url.includes("169.254")));
   });
 
   test("without a settlement preimage, one is derived from the invoice", async () => {

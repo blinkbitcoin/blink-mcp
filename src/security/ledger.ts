@@ -42,8 +42,15 @@ export type Reservation =
   | { ok: true; id: string }
   | { ok: false; spent: number };
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 /**
@@ -51,8 +58,11 @@ function sleepSync(ms: number): void {
  * processes.
  *
  * - Every read-modify-write runs under an exclusive lock file
- *   (`<ledger>.lock`, created with O_EXCL), so concurrent processes cannot lose
- *   each other's updates. A lock older than 30s is treated as abandoned.
+ *   (`<ledger>.lock`, created with O_EXCL and holding "<pid>:<token>"), so
+ *   concurrent processes cannot lose each other's updates. A lock is only
+ *   broken when its owner process is gone (or, for an unreadable lock, after
+ *   30s), and a holder only ever removes its own lock. Waiting is async, so a
+ *   contended lock never blocks the event loop.
  * - Writes go to a temp file that is renamed into place, so a crash never
  *   leaves a truncated ledger.
  * - A missing ledger is empty; a ledger that exists but cannot be parsed throws
@@ -122,35 +132,80 @@ export class SpendLedger {
     }
   }
 
-  private withLock<T>(fn: () => T): T {
+  /** True when the lock content names a dead owner (or is unreadable and old). */
+  private isStale(content: string, mtimeMs: number): boolean {
+    const pid = Number(content.split(":")[0]);
+    if (Number.isInteger(pid) && pid > 0) return !pidAlive(pid);
+    // Empty/garbled: the owner died between creating and writing the lock.
+    return Date.now() - mtimeMs > LOCK_STALE_MS;
+  }
+
+  /**
+   * Remove a stale lock without ever removing a live one. The lock is renamed
+   * aside (atomic) and its content compared with what was judged stale; if a
+   * waiter replaced it in between, the moved lock is linked back into place.
+   */
+  private breakStaleLock(staleContent: string): void {
+    const aside = `${this.lockFile}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.stale`;
+    try {
+      fs.renameSync(this.lockFile, aside);
+    } catch {
+      return; // already gone — just retry acquiring
+    }
+    if (fs.readFileSync(aside, "utf8") !== staleContent) {
+      try {
+        fs.linkSync(aside, this.lockFile);
+      } catch {
+        // A third process created a lock meanwhile; theirs stands.
+      }
+    }
+    fs.rmSync(aside, { force: true });
+  }
+
+  private async withLock<T>(fn: () => T): Promise<T> {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    const token = `${process.pid}:${crypto.randomUUID()}`;
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
     for (;;) {
       try {
-        fs.closeSync(fs.openSync(this.lockFile, "wx", 0o600));
+        const fd = fs.openSync(this.lockFile, "wx", 0o600);
+        try {
+          fs.writeSync(fd, token);
+        } finally {
+          fs.closeSync(fd);
+        }
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        let content: string;
+        let mtimeMs: number;
         try {
-          if (Date.now() - fs.statSync(this.lockFile).mtimeMs > LOCK_STALE_MS) {
-            fs.rmSync(this.lockFile, { force: true });
-            continue;
-          }
+          content = fs.readFileSync(this.lockFile, "utf8");
+          mtimeMs = fs.statSync(this.lockFile).mtimeMs;
         } catch {
-          continue; // lock released between open and stat — retry
+          continue; // lock released between open and read — retry
+        }
+        if (this.isStale(content, mtimeMs)) {
+          this.breakStaleLock(content);
+          continue;
         }
         if (Date.now() > deadline) {
           throw new Error(
             `Timed out waiting for spend ledger lock ${this.lockFile}. Refusing to spend.`,
           );
         }
-        sleepSync(10 + Math.floor(Math.random() * 20));
+        await sleep(10 + Math.floor(Math.random() * 20));
       }
     }
     try {
       return fn();
     } finally {
-      fs.rmSync(this.lockFile, { force: true });
+      // Only remove the lock if it is still ours.
+      try {
+        if (fs.readFileSync(this.lockFile, "utf8") === token) fs.rmSync(this.lockFile);
+      } catch {
+        // already gone
+      }
     }
   }
 
@@ -168,8 +223,8 @@ export class SpendLedger {
    * Atomically check the budget and reserve `amount` sats. With a null budget
    * the reservation always succeeds (it still records the spend).
    */
-  reserve(amount: number, budget: number | null): Reservation {
-    return this.withLock(() => {
+  reserve(amount: number, budget: number | null): Promise<Reservation> {
+    return this.withLock((): Reservation => {
       const records = this.pruned();
       const spent = records.reduce((sum, r) => sum + r.amount, 0);
       if (budget !== null && spent + amount > budget) {
@@ -183,8 +238,8 @@ export class SpendLedger {
   }
 
   /** Mark a reservation as a completed spend. */
-  commit(id: string): void {
-    this.withLock(() => {
+  commit(id: string): Promise<void> {
+    return this.withLock(() => {
       const records = this.pruned();
       const r = records.find((x) => x.id === id);
       if (r) delete r.status;
@@ -193,15 +248,15 @@ export class SpendLedger {
   }
 
   /** Drop a reservation whose payment did not go through. */
-  release(id: string): void {
-    this.withLock(() => {
+  release(id: string): Promise<void> {
+    return this.withLock(() => {
       this.write(this.pruned().filter((x) => x.id !== id));
     });
   }
 
   /** Persist a completed spend (no budget check). */
-  record(amount: number): void {
-    const res = this.reserve(amount, null);
-    if (res.ok) this.commit(res.id);
+  async record(amount: number): Promise<void> {
+    const res = await this.reserve(amount, null);
+    if (res.ok) await this.commit(res.id);
   }
 }

@@ -27,6 +27,7 @@ describe("ipIsPrivate", () => {
     "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254
     "64:ff9b:1::1", // local-use NAT64
     "2002:7f00:1::", // 6to4 → 127.0.0.1
+    "::ffff:0:a9fe:a9fe", // IPv4-translated (SIIT) → 169.254.169.254
     "fe80::1",
     "fe90::1", // still inside fe80::/10
     "febf::1",
@@ -41,7 +42,7 @@ describe("ipIsPrivate", () => {
     test(`${ip} is non-public`, () => assert.equal(ipIsPrivate(ip), true));
   }
 
-  const publicIps = ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8", "2002:808:808::1"];
+  const publicIps = ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8", "2002:808:808::1", "::ffff:0:808:808"];
   for (const ip of publicIps) {
     test(`${ip} is public`, () => assert.equal(ipIsPrivate(ip), false));
   }

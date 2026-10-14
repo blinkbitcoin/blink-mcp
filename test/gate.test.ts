@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { loadSecurityConfig } from "../src/security/config.ts";
@@ -94,6 +94,7 @@ describe("runGuarded: webhooks", () => {
     const exec = executor();
     const res = await runGuarded("add_webhook", args, args, deps, exec.run);
     assert.equal(res.isError, true);
+    assert.equal(parse(res).error, "The request was not approved by the user.");
     assert.equal(exec.calls.n, 0);
   });
 
@@ -103,6 +104,7 @@ describe("runGuarded: webhooks", () => {
     const res = await runGuarded("add_webhook", args, args, deps, exec.run);
     assert.equal(res.isError, true);
     assert.match(String(parse(res).error), /fail-closed/);
+    assert.doesNotMatch(String(parse(res).error), /payment/i);
     assert.equal(exec.calls.n, 0);
   });
 
@@ -205,6 +207,20 @@ describe("USD amounts are converted to sats before cap checks", () => {
     assert.equal(d.action, "deny");
   });
 
+  test("no price lookup is made when no cap or budget needs it", async () => {
+    let lookups = 0;
+    const c = ctx({}, {
+      toSats: async (cents) => {
+        lookups++;
+        return cents * 10;
+      },
+    });
+    const d = await evaluateSpend(c, "send_onchain_usd", extractSpendIntent("send_onchain_usd", { amount: 5, address: "bc1q" }));
+    assert.equal(d.action, "confirm");
+    assert.equal(lookups, 0);
+    assert.match((d as { summary: string }).summary, /5 USD cents to/);
+  });
+
   test("conversion failure without caps still asks for confirmation", async () => {
     const c = ctx({}, { toSats: async () => NaN });
     const d = await evaluateSpend(c, "send_onchain_usd", extractSpendIntent("send_onchain_usd", { amount: 1, address: "bc1q" }));
@@ -246,14 +262,29 @@ describe("runGuarded: budget reservation", () => {
     assert.equal(c.ledger.spentLast24h(), 0);
   });
 
-  test("releases when the handler throws", async () => {
+  test("keeps the reservation pending when the handler throws (outcome unknown)", async () => {
     const c = ctx(noConfirm);
     await assert.rejects(() =>
       runGuarded("send_to_wallet", a, a, gateDeps(c).deps, async () => {
-        throw new Error("network");
+        throw new Error("network timeout");
       }),
     );
-    assert.equal(c.ledger.spentLast24h(), 0);
+    assert.equal(c.ledger.spentLast24h(), 400);
+  });
+
+  test("a ledger failure after a successful payment does not report an error", async () => {
+    for (const budget of [1000, null]) {
+      const c = ctx({ requireConfirmation: false, dailyBudgetSats: budget });
+      (c.ledger as unknown as { commit: () => Promise<never> }).commit = async () => {
+        throw new Error("Timed out waiting for spend ledger lock");
+      };
+      const { deps, printed } = gateDeps(c);
+      const res = await runGuarded("send_to_wallet", a, a, deps, executor({ success: true }).run);
+      assert.equal(res.isError, undefined);
+      assert.equal(parse(res).success, true);
+      assert.match(printed.join(""), /could not settle reservation/);
+      assert.equal(c.ledger.spentLast24h(), 400); // still pending → still counted
+    }
   });
 
   test("an in-flight spend counts against concurrent ones", async () => {
@@ -292,23 +323,23 @@ describe("runGuarded: budget reservation", () => {
 // ── SpendLedger: locking, atomic writes, fail-closed ──────────────────────
 
 describe("SpendLedger hardening", () => {
-  test("reserve respects the budget across instances sharing a file", () => {
+  test("reserve respects the budget across instances sharing a file", async () => {
     const file = tmpLedgerFile();
     const l1 = new SpendLedger(file);
     const l2 = new SpendLedger(file);
-    assert.equal(l1.reserve(600, 1000).ok, true);
-    assert.equal(l2.reserve(600, 1000).ok, false);
-    assert.equal(l2.reserve(400, 1000).ok, true);
+    assert.equal((await l1.reserve(600, 1000)).ok, true);
+    assert.equal((await l2.reserve(600, 1000)).ok, false);
+    assert.equal((await l2.reserve(400, 1000)).ok, true);
     assert.equal(l1.spentLast24h(), 1000);
   });
 
-  test("release frees a reservation; commit keeps it", () => {
+  test("release frees a reservation; commit keeps it", async () => {
     const l = new SpendLedger(tmpLedgerFile());
-    const a = l.reserve(100, null);
-    const b = l.reserve(200, null);
+    const a = await l.reserve(100, null);
+    const b = await l.reserve(200, null);
     assert.ok(a.ok && b.ok);
-    l.release(a.id);
-    l.commit(b.id);
+    await l.release(a.id);
+    await l.commit(b.id);
     assert.equal(l.spentLast24h(), 200);
   });
 
@@ -320,39 +351,113 @@ describe("SpendLedger hardening", () => {
     assert.throws(() => new SpendLedger(file).spentLast24h(), LedgerCorruptError);
   });
 
-  test("legacy records without status still count", () => {
+  test("legacy records without status still count", async () => {
     const file = tmpLedgerFile();
     fs.writeFileSync(file, JSON.stringify([{ at: Date.now(), amount: 700 }]));
     const l = new SpendLedger(file);
     assert.equal(l.spentLast24h(), 700);
-    assert.equal(l.reserve(400, 1000).ok, false);
+    assert.equal((await l.reserve(400, 1000)).ok, false);
   });
 
-  test("writes via rename: 0600 file, no temp or lock files left behind", (t) => {
+  test("writes via rename: 0600 file, no temp or lock files left behind", async (t) => {
     if (process.platform === "win32") {
       t.skip("POSIX perms n/a on Windows");
       return;
     }
     const file = tmpLedgerFile();
-    new SpendLedger(file).record(10);
+    await new SpendLedger(file).record(10);
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.deepEqual(fs.readdirSync(path.dirname(file)), ["spend-ledger.json"]);
   });
 
-  test("a stale lock is broken; a live lock times out and refuses", () => {
+  test("an unreadable lock is broken only once it is old", async () => {
     const file = tmpLedgerFile();
     const lock = `${file}.lock`;
     fs.writeFileSync(lock, "");
     const old = new Date(Date.now() - 60_000);
     fs.utimesSync(lock, old, old);
     const l = new SpendLedger(file);
-    l.record(5);
+    await l.record(5);
     assert.equal(l.spentLast24h(), 5);
 
-    fs.writeFileSync(lock, ""); // fresh lock held by "another process"
-    assert.throws(() => l.record(5), /Timed out waiting for spend ledger lock/);
+    fs.writeFileSync(lock, ""); // fresh, owner may still be writing it
+    await assert.rejects(() => l.record(5), /Timed out waiting for spend ledger lock/);
     fs.rmSync(lock);
   });
+
+  test("a lock whose owner process is gone is broken immediately", async () => {
+    const file = tmpLedgerFile();
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
+    fs.writeFileSync(`${file}.lock`, `${deadPid}:tok`);
+    const l = new SpendLedger(file);
+    await l.record(7);
+    assert.equal(l.spentLast24h(), 7);
+    assert.equal(fs.existsSync(`${file}.lock`), false);
+  });
+
+  test("a live owner's lock is never broken, however old", async () => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    fs.writeFileSync(lock, `${process.pid}:someone-else`);
+    const old = new Date(Date.now() - 10 * 60_000);
+    fs.utimesSync(lock, old, old);
+    await assert.rejects(() => new SpendLedger(file).record(1), /Timed out/);
+    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:someone-else`);
+    fs.rmSync(lock);
+  });
+
+  test("breaking a stale lock restores a live lock created in the meantime", async (t) => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
+    fs.writeFileSync(lock, `${deadPid}:stale`);
+    // Another waiter breaks the stale lock and takes its own just before our
+    // rename: our rename then moves THEIR lock, which must be put back.
+    const realRename = fs.renameSync;
+    let raced = false;
+    t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+      if (!raced && from === lock) {
+        raced = true;
+        fs.writeFileSync(lock, `${process.pid}:winner`);
+      }
+      return realRename(from, to);
+    });
+    await assert.rejects(() => new SpendLedger(file).record(1), /Timed out/);
+    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:winner`);
+    fs.rmSync(lock);
+  });
+
+  test("a holder never removes a lock it no longer owns", async () => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    const l = new SpendLedger(file);
+    // Swap the lock under the holder mid-critical-section.
+    (l as unknown as { pruned: () => unknown[] }).pruned = () => {
+      fs.writeFileSync(lock, "999999:other");
+      return [];
+    };
+    await l.release("x");
+    assert.equal(fs.readFileSync(lock, "utf8"), "999999:other");
+    fs.rmSync(lock);
+  });
+
+  test("waiting for the lock does not block the event loop", async () => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    fs.writeFileSync(lock, `${process.pid}:held`);
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 5);
+    const release = setTimeout(() => fs.rmSync(lock, { force: true }), 200);
+    try {
+      await new SpendLedger(file).record(1);
+    } finally {
+      clearInterval(timer);
+      clearTimeout(release);
+      fs.rmSync(lock, { force: true });
+    }
+    assert.ok(ticks >= 10, `event loop ran only ${ticks} ticks while waiting`);
+  });
+
 
   test("concurrent processes never overspend the budget", async () => {
     const file = tmpLedgerFile();
@@ -365,8 +470,8 @@ describe("SpendLedger hardening", () => {
       const l = new SpendLedger(${JSON.stringify(file)});
       let ok = 0;
       for (let i = 0; i < 10; i++) {
-        const r = l.reserve(100, 1000);
-        if (r.ok) { l.commit(r.id); ok++; }
+        const r = await l.reserve(100, 1000);
+        if (r.ok) { await l.commit(r.id); ok++; }
       }
       process.stdout.write(String(ok));
     `;
@@ -424,7 +529,7 @@ describe("runGuarded: spend paths", () => {
     const c = ctx({ dailyBudgetSats: 1000 });
     const { deps } = gateDeps(c, {
       elicit: async () => {
-        c.ledger.record(900); // concurrent spend while the human decides
+        await c.ledger.record(900); // concurrent spend while the human decides
         return true;
       },
     });
@@ -467,30 +572,30 @@ describe("guard helpers: edge cases", () => {
     assert.match((r as { reason: string }).reason, /Spend ledger unavailable \(lock timeout\)/);
   });
 
-  test("reserveSpend: over budget, ledger failure with and without a budget", () => {
+  test("reserveSpend: over budget, ledger failure with and without a budget", async () => {
     const over = ctx({ dailyBudgetSats: 100 });
-    assert.equal(reserveSpend(over, 200).ok, false);
+    assert.equal((await reserveSpend(over, 200)).ok, false);
 
     const broken = (budget: number | null) => {
       const c = ctx({ dailyBudgetSats: budget });
-      (c.ledger as unknown as { reserve: () => never }).reserve = () => {
+      (c.ledger as unknown as { reserve: () => Promise<never> }).reserve = async () => {
         throw new Error("disk full");
       };
       return c;
     };
-    const denied = reserveSpend(broken(1000), 10);
+    const denied = await reserveSpend(broken(1000), 10);
     assert.equal(denied.ok, false);
     assert.match((denied as { reason: string }).reason, /disk full/);
 
     const warnings: string[] = [];
-    const allowed = reserveSpend(broken(null), 10, (l) => warnings.push(l));
+    const allowed = await reserveSpend(broken(null), 10, (l) => warnings.push(l));
     assert.equal(allowed.ok, true);
     if (allowed.ok) {
-      allowed.commit();
-      allowed.release();
+      await allowed.commit();
+      await allowed.release();
     }
     assert.match(warnings[0], /\[spend-ledger\] disk full/);
-    assert.equal(reserveSpend(broken(null), 10).ok, true); // default warn is a no-op
+    assert.equal((await reserveSpend(broken(null), 10)).ok, true); // default warn is a no-op
   });
 
   test("evaluateWebhook: missing URL is denied; confirmation off allows", () => {
@@ -556,12 +661,12 @@ describe("SpendLedger: unreadable and unwritable files", () => {
     assert.throws(() => new SpendLedger(file).spentLast24h(), LedgerCorruptError);
   });
 
-  test("a failed write cleans up its temp file and propagates", (t) => {
+  test("a failed write cleans up its temp file and propagates", async (t) => {
     const file = tmpLedgerFile();
     t.mock.method(fs, "renameSync", () => {
       throw new Error("EXDEV");
     });
-    assert.throws(() => new SpendLedger(file).record(1), /EXDEV/);
+    await assert.rejects(() => new SpendLedger(file).record(1), /EXDEV/);
     assert.deepEqual(fs.readdirSync(path.dirname(file)), []);
   });
 });

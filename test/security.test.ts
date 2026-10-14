@@ -140,9 +140,9 @@ describe("enforceAmount", () => {
     assert.equal(enforceAmount(c, 500).ok, true);
   });
 
-  test("denies over daily budget including prior spend", () => {
+  test("denies over daily budget including prior spend", async () => {
     const c = ctx({ dailyBudgetSats: 1000 });
-    c.ledger.record(800);
+    await c.ledger.record(800);
     assert.equal(enforceAmount(c, 300).ok, false);
     assert.equal(enforceAmount(c, 200).ok, true);
   });
@@ -371,32 +371,32 @@ describe("hashArgs", () => {
 // ── durable ledger ──────────────────────────────────────────────────────────
 
 describe("SpendLedger", () => {
-  test("persists across instances (survives restart)", () => {
+  test("persists across instances (survives restart)", async () => {
     const file = memLedgerFile();
     const l1 = new SpendLedger(file);
-    l1.record(300);
-    l1.record(200);
+    await l1.record(300);
+    await l1.record(200);
     // New instance simulates a server restart.
     const l2 = new SpendLedger(file);
     assert.equal(l2.spentLast24h(), 500);
   });
 
-  test("prunes entries older than 24h", () => {
+  test("prunes entries older than 24h", async () => {
     const file = memLedgerFile();
     let now = 1_000_000_000_000;
     const l = new SpendLedger(file, () => now);
-    l.record(1000);
+    await l.record(1000);
     now += 25 * 60 * 60 * 1000; // +25h
     assert.equal(l.spentLast24h(), 0);
   });
 
-  test("writes a 0600 file", (t) => {
+  test("writes a 0600 file", async (t) => {
     if (process.platform === "win32") {
       t.skip("POSIX perms n/a on Windows");
       return;
     }
     const file = memLedgerFile();
-    new SpendLedger(file).record(10);
+    await new SpendLedger(file).record(10);
     const mode = fs.statSync(file).mode & 0o777;
     assert.equal(mode, 0o600);
   });
