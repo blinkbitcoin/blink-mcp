@@ -269,6 +269,17 @@ describe("l402_pay", () => {
     assert.equal(r.success, true);
   });
 
+  test("a network error on the l402-protocol invoice POST is a parse failure, not a crash", async () => {
+    route({
+      [`GET ${ORIGIN}/res`]: json(402, { payment_request_url: `${ORIGIN}/pay` }),
+      [`POST ${ORIGIN}/pay`]: () => {
+        throw new Error("ECONNRESET");
+      },
+    });
+    const r = await pay(fakeClient().client, guard());
+    assert.match(String(r.error), /Could not parse L402 challenge/);
+  });
+
   test("an l402-protocol body with offers but no payment URL is refused", async () => {
     route({ [`GET ${ORIGIN}/res`]: json(402, { offers: [] }) });
     const r = await pay(fakeClient().client, guard());

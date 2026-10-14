@@ -427,6 +427,61 @@ describe("SpendLedger hardening", () => {
     fs.rmSync(lock);
   });
 
+  test("a stale lock that vanishes before it is moved aside is simply retried", async (t) => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
+    fs.writeFileSync(lock, `${deadPid}:stale`);
+    const realRename = fs.renameSync;
+    let raced = false;
+    t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+      if (!raced && from === lock) {
+        raced = true;
+        fs.rmSync(lock); // another waiter removed it first
+      }
+      return realRename(from, to);
+    });
+    const l = new SpendLedger(file);
+    await l.record(3);
+    assert.equal(l.spentLast24h(), 3);
+  });
+
+  test("when a third lock appears during the restore, it is left in place", async (t) => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
+    fs.writeFileSync(lock, `${deadPid}:stale`);
+    const realRename = fs.renameSync;
+    const realLink = fs.linkSync;
+    let raced = false;
+    t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+      if (!raced && from === lock) {
+        raced = true;
+        fs.writeFileSync(lock, `${process.pid}:second`); // moved aside by our rename
+      }
+      return realRename(from, to);
+    });
+    t.mock.method(fs, "linkSync", (from: fs.PathLike, to: fs.PathLike) => {
+      fs.writeFileSync(lock, `${process.pid}:third`); // created before we restore
+      return realLink(from, to);
+    });
+    await assert.rejects(() => new SpendLedger(file).record(1), /Timed out/);
+    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:third`);
+    assert.deepEqual(fs.readdirSync(path.dirname(file)), ["spend-ledger.json.lock"]);
+    fs.rmSync(lock);
+  });
+
+  test("a holder whose lock was already removed finishes cleanly", async () => {
+    const file = tmpLedgerFile();
+    const l = new SpendLedger(file);
+    (l as unknown as { pruned: () => unknown[] }).pruned = () => {
+      fs.rmSync(`${file}.lock`);
+      return [];
+    };
+    await l.release("x");
+    assert.equal(fs.existsSync(`${file}.lock`), false);
+  });
+
   test("a holder never removes a lock it no longer owns", async () => {
     const file = tmpLedgerFile();
     const lock = `${file}.lock`;
