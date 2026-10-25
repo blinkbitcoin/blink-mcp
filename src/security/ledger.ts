@@ -141,6 +141,23 @@ export class SpendLedger {
     return Number.isInteger(pid) && pid > 0 ? pid : null;
   }
 
+  /**
+   * Lock content, or null if the lock vanished (released between open and
+   * read). Any other read error (EISDIR, EACCES, …) is persistent: retrying
+   * would never succeed, so it fails closed.
+   */
+  private readLock(): string | null {
+    try {
+      return fs.readFileSync(this.lockFile, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return null;
+      throw new Error(
+        `Spend ledger lock ${this.lockFile} cannot be read (${code ?? (err as Error).message}). Refusing to spend; fix or remove it to resume.`,
+      );
+    }
+  }
+
   private async withLock<T>(fn: () => T): Promise<T> {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const token = `${process.pid}:${crypto.randomUUID()}`;
@@ -156,13 +173,8 @@ export class SpendLedger {
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        let content: string;
-        try {
-          content = fs.readFileSync(this.lockFile, "utf8");
-        } catch {
-          continue; // lock released between open and read — retry
-        }
-        const pid = SpendLedger.ownerPid(content);
+        const content = this.readLock();
+        const pid = content === null ? null : SpendLedger.ownerPid(content);
         if (pid !== null && !pidAlive(pid)) {
           throw new Error(
             `Spend ledger lock ${this.lockFile} was left by a process that is no longer running (pid ${pid}). Refusing to spend; remove the lock file to resume.`,

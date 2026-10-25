@@ -479,6 +479,79 @@ describe("SpendLedger hardening", () => {
     assert.ok(ticks >= 10, `event loop ran only ${ticks} ticks while waiting`);
   });
 
+  // A synchronous spin would also block node:test's own timeout, so these run
+  // the ledger in a child process that spawnSync kills after 10s.
+  function recordInChild(file: string): { status: number | null; out: string; ms: number } {
+    const ledgerModule = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../src/security/ledger.ts",
+    );
+    const script = `
+      import { SpendLedger } from ${JSON.stringify(ledgerModule)};
+      await new SpendLedger(${JSON.stringify(file)}).record(1).then(
+        () => process.stdout.write("settled"),
+        (e) => process.stdout.write("rejected: " + e.message),
+      );
+    `;
+    const started = Date.now();
+    const r = spawnSync(
+      process.execPath,
+      ["--import", "tsx/esm", "--input-type=module", "-e", script],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    return { status: r.status, out: r.stdout ?? "", ms: Date.now() - started };
+  }
+
+  test("a lock path that is a directory (EISDIR) refuses instead of spinning", () => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    fs.mkdirSync(lock);
+    const r = recordInChild(file);
+    assert.equal(r.status, 0, `child did not exit cleanly (killed by timeout?): ${r.out}`);
+    assert.match(r.out, /^rejected: .*cannot be read \(EISDIR\)/);
+    assert.ok(r.ms < 5_000, `took ${r.ms}ms`);
+    assert.ok(fs.statSync(lock).isDirectory(), "lock path left in place");
+    fs.rmSync(lock, { recursive: true });
+  });
+
+  test("an unreadable lock file (EACCES) refuses instead of spinning", (t) => {
+    if (process.platform === "win32" || process.getuid?.() === 0) {
+      t.skip("file modes are not enforced here");
+      return;
+    }
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    fs.writeFileSync(lock, `${process.pid}:held`, { mode: 0o000 });
+    const r = recordInChild(file);
+    assert.equal(r.status, 0, `child did not exit cleanly (killed by timeout?): ${r.out}`);
+    assert.match(r.out, /^rejected: .*cannot be read \(EACCES\)/);
+    assert.ok(r.ms < 5_000, `took ${r.ms}ms`);
+    fs.chmodSync(lock, 0o600);
+    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:held`);
+    fs.rmSync(lock);
+  });
+
+  test("a lock that vanishes between open and read is retried", async (t) => {
+    const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
+    fs.writeFileSync(lock, `${process.pid}:held`);
+    const realRead = fs.readFileSync;
+    let raced = false;
+    t.mock.method(fs, "readFileSync", (p: fs.PathOrFileDescriptor, o?: unknown) => {
+      if (!raced && p === lock) {
+        raced = true;
+        fs.rmSync(lock); // owner released it just before our read
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      }
+      return (realRead as (p: fs.PathOrFileDescriptor, o?: unknown) => unknown)(p, o);
+    });
+    const l = new SpendLedger(file);
+    await l.record(4);
+    t.mock.restoreAll();
+    assert.ok(raced);
+    assert.equal(l.spentLast24h(), 4);
+  });
+
 
   test("concurrent processes never overspend the budget", async () => {
     const file = tmpLedgerFile();
