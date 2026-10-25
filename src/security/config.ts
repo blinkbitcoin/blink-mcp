@@ -40,8 +40,8 @@ export interface SecurityConfig {
   /**
    * Allowed hostnames for L402 outbound fetches (exact, case-insensitive).
    * REQUIRED for L402 server-side fetches: when empty, l402_pay / l402_discover
-   * fail closed. This closes the DNS-rebinding TOCTOU gap without pinning the
-   * socket, by constraining which hosts may be contacted at all.
+   * fail closed. Sockets are not pinned, so this narrows (does not close) the
+   * DNS-rebinding TOCTOU gap to hosts the operator trusts.
    */
   l402HostAllowlist: Set<string>;
 }

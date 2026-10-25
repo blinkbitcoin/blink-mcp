@@ -8,15 +8,21 @@
 //   4. human confirmation (via MCP elicitation; otherwise fail-closed, or an
 //      out-of-band stderr approval code the model cannot read)
 //
+// USD-wallet amounts (cents) are converted to sats before the cap and budget
+// checks. Right before a payment executes, its sats are reserved in the ledger
+// under a lock (reserveSpend) and committed only if the payment succeeds.
 // For tools whose amount is unknown up front (l402_pay), the amount checks are
-// re-run post-decode via enforceAmount() before the payment is sent, and the
-// budget is debited only on a successful payment.
+// re-run post-decode via enforceAmount()/reserveSpend() inside the handler.
+//
+// Webhook-changing tools (CONFIRM_TOOLS) pass the webhook URL policy and the
+// same human confirmation step.
 //
 // Any failed check returns a structured refusal and executes NOTHING.
 
 import crypto from "node:crypto";
+import net from "node:net";
 import type { SecurityConfig } from "./config.js";
-import type { SpendLedger } from "./ledger.js";
+import { LedgerCorruptError, type SpendLedger } from "./ledger.js";
 import { decodeBolt11AmountSats } from "../bolt11.js";
 
 // ── Spend tool classification ──────────────────────────────────────────────
@@ -44,9 +50,29 @@ export function isSpendTool(toolName: string): boolean {
   return SPEND_TOOLS.has(toolName);
 }
 
+/**
+ * Non-spend tools that change where account data goes and therefore need the
+ * same human confirmation as spends. A prompt-injected add_webhook would turn
+ * the account callback into a persistent payment-metadata exfiltration channel;
+ * remove_webhook silently cuts the operator's own notifications.
+ */
+export const CONFIRM_TOOLS = new Set<string>(["add_webhook", "remove_webhook"]);
+
+/** True for every tool that must pass through the guard before executing. */
+export function requiresGuard(toolName: string): boolean {
+  return SPEND_TOOLS.has(toolName) || CONFIRM_TOOLS.has(toolName);
+}
+
+export type SpendCurrency = "BTC" | "USD";
+
 export interface SpendIntent {
-  /** Amount in sats/cents, or null when it cannot be known up front. */
+  /**
+   * Amount in the unit of `currency` (sats for BTC, cents for USD), or null
+   * when it cannot be known up front.
+   */
   amount: number | null;
+  /** Unit of `amount`. Defaults to BTC (sats) when omitted. */
+  currency?: SpendCurrency;
   /** Best-effort recipient identifier for allowlist checks, or null. */
   recipient: string | null;
   /** True when the tool sweeps the whole balance (unbounded amount). */
@@ -91,6 +117,7 @@ export function extractSpendIntent(
         undecodable: decoded === null,
       };
     }
+    // The handler always pays via the BTC no-amount mutation, so the amount is sats.
     case "pay_invoice_with_amount":
       return { amount: num(args.amount), recipient: str(args.payment_request), isSweep: false };
     case "pay_lightning_address":
@@ -98,15 +125,22 @@ export function extractSpendIntent(
     case "pay_lnurl":
       return { amount: num(args.amount), recipient: str(args.lnurl), isSweep: false };
     case "send_onchain":
+      return { amount: num(args.amount), currency: "BTC", recipient: str(args.address), isSweep: false };
     case "send_onchain_usd":
-      return { amount: num(args.amount), recipient: str(args.address), isSweep: false };
+      return { amount: num(args.amount), currency: "USD", recipient: str(args.address), isSweep: false };
     case "send_onchain_all":
       return { amount: null, recipient: str(args.address), isSweep: true };
     case "send_to_wallet":
+      return { amount: num(args.amount), currency: "BTC", recipient: str(args.recipient_wallet_id), isSweep: false };
     case "send_to_wallet_usd":
-      return { amount: num(args.amount), recipient: str(args.recipient_wallet_id), isSweep: false };
+      return { amount: num(args.amount), currency: "USD", recipient: str(args.recipient_wallet_id), isSweep: false };
     case "send_to_username":
-      return { amount: num(args.amount), recipient: str(args.username), isSweep: false };
+      return {
+        amount: num(args.amount),
+        currency: args.wallet_currency === "USD" ? "USD" : "BTC",
+        recipient: str(args.username),
+        isSweep: false,
+      };
     case "l402_pay":
       // Price is discovered during the call; unknown up front.
       return { amount: null, recipient: str(args.url), isSweep: false };
@@ -186,17 +220,29 @@ export function hashArgs(args: Record<string, unknown>): string {
 // ── Guard decision ─────────────────────────────────────────────────────────
 
 export type GuardDecision =
-  | { action: "allow" }
+  | {
+      action: "allow";
+      /** The spend amount in sats, when known (null for non-spend tools). */
+      amountSats: number | null;
+    }
   | { action: "deny"; reason: string }
   | {
       action: "confirm";
       summary: string;
-      intent: SpendIntent;
+      amountSats: number | null;
     };
+
+/** Converts a USD-cent amount to sats at the current rate. */
+export type CentsToSats = (cents: number) => Promise<number>;
 
 export interface GuardContext {
   config: SecurityConfig;
   ledger: SpendLedger;
+  /**
+   * Converts USD-wallet amounts so they are checked against the sat-denominated
+   * caps and budget. When absent or failing, USD amounts are unknown in sats.
+   */
+  toSats?: CentsToSats;
 }
 
 function allowlistKey(v: string): string {
@@ -218,31 +264,122 @@ export function enforceAmount(
   if (config.maxPaymentSats !== null && amount > config.maxPaymentSats) {
     return {
       ok: false,
-      reason: `Amount ${amount} exceeds per-transaction cap BLINK_MAX_PAYMENT_SATS=${config.maxPaymentSats}. Refusing.`,
+      reason: `Amount ${amount} sats exceeds per-transaction cap BLINK_MAX_PAYMENT_SATS=${config.maxPaymentSats}. Refusing.`,
     };
   }
   if (config.dailyBudgetSats !== null) {
-    const already = ledger.spentLast24h();
+    let already: number;
+    try {
+      already = ledger.spentLast24h();
+    } catch (err) {
+      return { ok: false, reason: ledgerFailureReason(err) };
+    }
     if (already + amount > config.dailyBudgetSats) {
       return {
         ok: false,
-        reason: `Amount ${amount} would exceed the 24h budget BLINK_DAILY_BUDGET_SATS=${config.dailyBudgetSats} (already spent ${already}). Refusing.`,
+        reason: budgetExceededReason(amount, config.dailyBudgetSats, already),
       };
     }
   }
   return { ok: true };
 }
 
+function budgetExceededReason(amount: number, budget: number, already: number): string {
+  return `Amount ${amount} sats would exceed the 24h budget BLINK_DAILY_BUDGET_SATS=${budget} (already spent ${already}). Refusing.`;
+}
+
+function ledgerFailureReason(err: unknown): string {
+  return err instanceof LedgerCorruptError
+    ? err.message
+    : `Spend ledger unavailable (${(err as Error).message}). Refusing.`;
+}
+
+export type Reserved =
+  | { ok: true; commit: () => Promise<void>; release: () => Promise<void> }
+  | { ok: false; reason: string };
+
+/**
+ * Atomically check the 24h budget and reserve `amountSats` in the ledger right
+ * before a payment executes, so concurrent spends cannot both pass a stale
+ * budget check. The caller must commit() on a successful payment and release()
+ * on a definite failure; when the outcome is unknown (the payment call threw)
+ * it should do neither, so the pending entry keeps counting. With no budget
+ * configured, ledger failures do not block the spend (the ledger is then
+ * informational only) and are reported via `warn`.
+ */
+export async function reserveSpend(
+  ctx: GuardContext,
+  amountSats: number,
+  warn: (line: string) => void = () => {},
+): Promise<Reserved> {
+  const budget = ctx.config.dailyBudgetSats;
+  try {
+    const res = await ctx.ledger.reserve(amountSats, budget);
+    if (!res.ok) {
+      return { ok: false, reason: budgetExceededReason(amountSats, budget as number, res.spent) };
+    }
+    return {
+      ok: true,
+      commit: () => ctx.ledger.commit(res.id),
+      release: () => ctx.ledger.release(res.id),
+    };
+  } catch (err) {
+    if (budget !== null) return { ok: false, reason: ledgerFailureReason(err) };
+    warn(`[spend-ledger] ${(err as Error).message}`);
+    return { ok: true, commit: async () => {}, release: async () => {} };
+  }
+}
+
+/**
+ * Settle a reservation after the payment has run. A ledger failure here must
+ * not turn a completed payment into a reported error (the caller could retry
+ * and pay twice), so it is only logged; the entry stays pending and keeps
+ * counting toward the budget, which errs on the safe side.
+ */
+export async function settleReservation(
+  settle: () => Promise<void>,
+  warn: (line: string) => void,
+): Promise<void> {
+  try {
+    await settle();
+  } catch (err) {
+    warn(`[spend-ledger] could not settle reservation: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Resolve an intent's amount in sats. BTC amounts pass through; USD cents are
+ * converted via ctx.toSats (rounded up) — but only when a cap or budget needs
+ * the sats figure, to avoid a price lookup on every USD spend by default.
+ * Returns null when the amount is unknown or not converted.
+ */
+async function amountInSats(
+  ctx: GuardContext,
+  intent: SpendIntent,
+  capsConfigured: boolean,
+): Promise<number | null> {
+  if (intent.amount === null) return null;
+  if ((intent.currency ?? "BTC") === "BTC") return intent.amount;
+  if (!capsConfigured || !ctx.toSats) return null;
+  try {
+    const sats = await ctx.toSats(intent.amount);
+    return Number.isFinite(sats) && sats >= 0 ? Math.ceil(sats) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Evaluate allowlist + caps + budget for a spend. Does NOT handle confirmation
- * (that requires async client interaction) — returns "confirm" when the caller
- * must obtain human approval, or "allow"/"deny" for the synchronous checks.
+ * (that requires client interaction) — returns "confirm" when the caller must
+ * obtain human approval, or "allow"/"deny" otherwise. USD-cent amounts are
+ * converted to sats before being compared with the sat-denominated caps.
  */
-export function evaluateSpend(
+export async function evaluateSpend(
   ctx: GuardContext,
   toolName: string,
   intent: SpendIntent,
-): GuardDecision {
+): Promise<GuardDecision> {
   const { config } = ctx;
 
   // 1. Recipient allowlist (all recipient types).
@@ -266,12 +403,22 @@ export function evaluateSpend(
   const capsConfigured =
     config.maxPaymentSats !== null || config.dailyBudgetSats !== null;
 
-  if (intent.amount !== null) {
-    // Amount known up front → enforce the cap/budget now.
-    const amountCheck = enforceAmount(ctx, intent.amount);
+  const amountSats = await amountInSats(ctx, intent, capsConfigured);
+
+  if (amountSats !== null) {
+    // Amount known up front → enforce the cap/budget now (in sats).
+    const amountCheck = enforceAmount(ctx, amountSats);
     if (!amountCheck.ok) {
       return { action: "deny", reason: amountCheck.reason };
     }
+  } else if (intent.amount !== null && capsConfigured) {
+    // A USD amount we could not convert: comparing cents to sat caps would
+    // under-enforce them, so refuse.
+    return {
+      action: "deny",
+      reason:
+        "A spend cap is configured but this USD amount could not be converted to sats to check it. Refusing rather than bypassing the cap.",
+    };
   } else if (capsConfigured) {
     // Amount is null with a cap configured. There are three cases:
     if (intent.undecodable) {
@@ -308,12 +455,36 @@ export function evaluateSpend(
   if (config.requireConfirmation) {
     return {
       action: "confirm",
-      summary: describeSpend(toolName, intent),
-      intent,
+      summary: describeSpend(toolName, intent, amountSats),
+      amountSats,
     };
   }
 
-  return { action: "allow" };
+  return { action: "allow", amountSats };
+}
+
+/**
+ * Evaluate a webhook-changing tool (CONFIRM_TOOLS). add_webhook must pass the
+ * URL policy first; both then require human confirmation like a spend.
+ */
+export function evaluateWebhook(
+  ctx: GuardContext,
+  toolName: string,
+  args: Record<string, unknown>,
+): GuardDecision {
+  let summary: string;
+  if (toolName === "add_webhook") {
+    const url = typeof args.url === "string" ? args.url : "";
+    const check = checkWebhookUrl(url, ctx.config.webhookAllowlist);
+    if (!check.ok) return { action: "deny", reason: check.reason };
+    summary = `Tool "add_webhook" will register ${url} as a callback endpoint for this account. It will receive a notification for every payment sent or received.`;
+  } else {
+    summary = `Tool "remove_webhook" will delete webhook endpoint ${String(args.id)}; it will stop receiving payment notifications.`;
+  }
+  if (ctx.config.requireConfirmation) {
+    return { action: "confirm", summary, amountSats: null };
+  }
+  return { action: "allow", amountSats: null };
 }
 
 // ── Webhook validation ─────────────────────────────────────────────────────
@@ -323,9 +494,10 @@ export type WebhookCheck =
   | { ok: false; reason: string };
 
 /**
- * Validate a webhook callback URL: must be HTTPS, and (when an allowlist is
- * configured) its hostname must be allowlisted. Prevents prompt-injected
- * registration of an attacker endpoint as the account's payment callback.
+ * Validate a webhook callback URL: must be HTTPS to a DNS hostname (no IP
+ * literals or localhost), and (when an allowlist is configured) its hostname
+ * must be allowlisted. Prevents prompt-injected registration of an attacker
+ * endpoint as the account's payment callback.
  */
 export function checkWebhookUrl(
   rawUrl: string,
@@ -344,6 +516,16 @@ export function checkWebhookUrl(
     };
   }
   const host = url.hostname.toLowerCase();
+  const bare = host.replace(/^\[(.*)\]$/, "$1");
+  if (net.isIP(bare) || bare.includes(":")) {
+    return {
+      ok: false,
+      reason: `Webhook URL must use a DNS hostname, not an IP address (got ${host}).`,
+    };
+  }
+  if (host === "localhost" || host.endsWith(".localhost")) {
+    return { ok: false, reason: "Webhook URL must not point at localhost." };
+  }
   if (allowlist.size > 0 && !allowlist.has(host)) {
     return {
       ok: false,
@@ -353,12 +535,21 @@ export function checkWebhookUrl(
   return { ok: true };
 }
 
-export function describeSpend(toolName: string, intent: SpendIntent): string {
+export function describeSpend(
+  toolName: string,
+  intent: SpendIntent,
+  amountSats: number | null = null,
+): string {
+  const usd = (intent.currency ?? "BTC") === "USD";
   const amount = intent.isSweep
     ? "ENTIRE WALLET BALANCE (sweep)"
-    : intent.amount !== null
-      ? `${intent.amount} (sats/cents)`
-      : "an amount determined during execution";
+    : intent.amount === null
+      ? "an amount determined during execution"
+      : !usd
+        ? `${intent.amount} sats`
+        : amountSats !== null
+          ? `${intent.amount} USD cents (≈${amountSats} sats)`
+          : `${intent.amount} USD cents`;
   const recipient = intent.recipient ?? "an unspecified recipient";
   return `Tool "${toolName}" will send ${amount} to ${recipient}.`;
 }
@@ -412,7 +603,7 @@ export async function confirmSpend(
     if (approved) return { status: "approved" };
     return {
       status: "rejected",
-      reason: "Payment was not approved by the user.",
+      reason: "The request was not approved by the user.",
     };
   }
 
@@ -420,7 +611,7 @@ export async function confirmSpend(
     return {
       status: "rejected",
       reason:
-        "This MCP client cannot obtain human approval (no elicitation support), and BLINK_APPROVAL_MODE is fail-closed. Refusing the payment. Use an elicitation-capable client, or set BLINK_APPROVAL_MODE=stderr-code to approve via the server console.",
+        "This MCP client cannot obtain human approval (no elicitation support), and BLINK_APPROVAL_MODE is fail-closed. Refusing. Use an elicitation-capable client, or set BLINK_APPROVAL_MODE=stderr-code to approve via the server console.",
     };
   }
 

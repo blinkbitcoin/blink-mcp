@@ -15,33 +15,119 @@ export class SsrfError extends Error {
   }
 }
 
+// Non-public IPv4 ranges (RFC 6890 special-purpose + multicast/reserved).
+const V4_BLOCKED: Array<[string, number]> = [
+  ["0.0.0.0", 8], // "this network"
+  ["10.0.0.0", 8], // private
+  ["100.64.0.0", 10], // CGNAT
+  ["127.0.0.0", 8], // loopback
+  ["169.254.0.0", 16], // link-local (incl. cloud metadata)
+  ["172.16.0.0", 12], // private
+  ["192.0.0.0", 24], // IETF protocol assignments
+  ["192.0.2.0", 24], // TEST-NET-1
+  ["192.168.0.0", 16], // private
+  ["198.18.0.0", 15], // benchmarking
+  ["198.51.100.0", 24], // TEST-NET-2
+  ["203.0.113.0", 24], // TEST-NET-3
+  ["224.0.0.0", 4], // multicast
+  ["240.0.0.0", 4], // reserved + broadcast
+];
+
+// Non-public IPv6 ranges. Ranges that embed an IPv4 address (mapped, compat,
+// NAT64, 6to4) are NOT listed here — they are unwrapped and the embedded IPv4
+// is checked against V4_BLOCKED instead.
+const V6_BLOCKED: Array<[string, number]> = [
+  ["::", 128], // unspecified
+  ["::1", 128], // loopback
+  ["64:ff9b:1::", 48], // local-use NAT64 (RFC 8215)
+  ["100::", 64], // discard-only
+  ["2001::", 32], // Teredo (embeds an obfuscated IPv4)
+  ["2001:db8::", 32], // documentation
+  ["fc00::", 7], // unique local
+  ["fe80::", 10], // link-local
+  ["fec0::", 10], // site-local (deprecated)
+  ["ff00::", 8], // multicast
+];
+
+const blocked = new net.BlockList();
+for (const [addr, prefix] of V4_BLOCKED) blocked.addSubnet(addr, prefix, "ipv4");
+for (const [addr, prefix] of V6_BLOCKED) blocked.addSubnet(addr, prefix, "ipv6");
+
+// Callers pass only addresses net.isIP() has already classified as IPv4.
 function ipv4IsPrivate(ip: string): boolean {
-  const parts = ip.split(".").map((p) => parseInt(p, 10));
-  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
-  const [a, b] = parts;
-  if (a === 10) return true; // 10.0.0.0/8
-  if (a === 127) return true; // loopback
-  if (a === 0) return true; // 0.0.0.0/8
-  if (a === 169 && b === 254) return true; // link-local
-  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-  if (a === 192 && b === 168) return true; // 192.168.0.0/16
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
-  if (a >= 224) return true; // multicast/reserved
-  return false;
+  return blocked.check(ip, "ipv4");
+}
+
+/**
+ * Expand an IPv6 address (already validated by net.isIP) into its eight 16-bit
+ * groups. A zone suffix ("%eth0") is ignored.
+ */
+function expandIpv6(ip: string): number[] {
+  let addr = ip.toLowerCase();
+  const zone = addr.indexOf("%");
+  if (zone !== -1) addr = addr.slice(0, zone);
+
+  // Replace a trailing dotted IPv4 with two hex groups.
+  const dotted = addr.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const o = dotted[2].split(".").map(Number);
+    addr =
+      dotted[1] +
+      ((o[0] << 8) | o[1]).toString(16) +
+      ":" +
+      ((o[2] << 8) | o[3]).toString(16);
+  }
+
+  const parse = (part: string): number[] =>
+    part === "" ? [] : part.split(":").map((h) => parseInt(h, 16));
+  if (!addr.includes("::")) return parse(addr);
+  const [head, tail] = addr.split("::");
+  const headGroups = parse(head);
+  const tailGroups = parse(tail);
+  const fill = 8 - headGroups.length - tailGroups.length;
+  return [...headGroups, ...new Array<number>(fill).fill(0), ...tailGroups];
+}
+
+function v4FromGroups(hi: number, lo: number): string {
+  return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join(".");
+}
+
+/**
+ * Return the IPv4 address embedded in an IPv6 address that routes to (or is
+ * translated into) IPv4, or null when there is none.
+ */
+function embeddedIpv4(g: number[]): string | null {
+  const zero = (from: number, to: number) =>
+    g.slice(from, to).every((x) => x === 0);
+  // ::ffff:a.b.c.d (IPv4-mapped), ::a.b.c.d (IPv4-compatible, deprecated) and
+  // ::ffff:0:a.b.c.d (IPv4-translated, RFC 2765 SIIT)
+  if (
+    zero(0, 4) &&
+    ((g[4] === 0 && (g[5] === 0xffff || g[5] === 0)) || (g[4] === 0xffff && g[5] === 0))
+  ) {
+    return v4FromGroups(g[6], g[7]);
+  }
+  // 64:ff9b::a.b.c.d (well-known NAT64 prefix)
+  if (g[0] === 0x64 && g[1] === 0xff9b && zero(2, 6)) {
+    return v4FromGroups(g[6], g[7]);
+  }
+  // 2002:aabb:ccdd::/48 (6to4)
+  if (g[0] === 0x2002) {
+    return v4FromGroups(g[1], g[2]);
+  }
+  return null;
 }
 
 function ipv6IsPrivate(ip: string): boolean {
-  const lower = ip.toLowerCase();
-  if (lower === "::1" || lower === "::") return true; // loopback / unspecified
-  if (lower.startsWith("fe80")) return true; // link-local
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // unique local
-  // IPv4-mapped (::ffff:a.b.c.d)
-  const mapped = lower.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return ipv4IsPrivate(mapped[1]);
+  const groups = expandIpv6(ip);
+  const canonical = groups.map((x) => x.toString(16)).join(":");
+  if (blocked.check(canonical, "ipv6")) return true;
+  const v4 = embeddedIpv4(groups);
+  if (v4 !== null) return ipv4IsPrivate(v4);
   return false;
 }
 
-function ipIsPrivate(ip: string): boolean {
+export function ipIsPrivate(ip: string): boolean {
   const type = net.isIP(ip);
   if (type === 4) return ipv4IsPrivate(ip);
   if (type === 6) return ipv6IsPrivate(ip);
@@ -55,10 +141,10 @@ function ipIsPrivate(ip: string): boolean {
  *
  * The allowlist is MANDATORY (fail-closed on empty). Node's global fetch
  * re-resolves DNS at request time, so a pre-flight IP check alone is subject to
- * a DNS-rebinding TOCTOU. Constraining which hostnames may be contacted at all
- * removes the attacker's ability to point the server at arbitrary internal
- * hosts. The public-IP check is retained as defence-in-depth for allowlisted
- * hosts and is re-run for every redirect hop by the caller.
+ * a DNS-rebinding TOCTOU. The allowlist narrows that exposure to hosts the
+ * operator trusts — it does not eliminate it, since sockets are not pinned to
+ * the checked address. The public-IP check is retained as defence-in-depth for
+ * allowlisted hosts and is re-run for every redirect hop by safeFetch().
  */
 export async function assertSafeUrl(
   rawUrl: string,
@@ -77,14 +163,16 @@ export async function assertSafeUrl(
     );
   }
 
-  const host = url.hostname.toLowerCase();
+  // URL.hostname keeps IPv6 literals bracketed ("[::1]"); strip the brackets so
+  // the literal is checked as an IP rather than handed to DNS.
+  const host = url.hostname.toLowerCase().replace(/^\[(.*)\]$/, "$1");
 
   if (allowlist.size === 0) {
     throw new SsrfError(
       "L402 server-side fetches require BLINK_L402_HOST_ALLOWLIST to be set (fail-closed). No hosts are allowed by default.",
     );
   }
-  if (!allowlist.has(host)) {
+  if (!allowlist.has(host) && !allowlist.has(`[${host}]`)) {
     throw new SsrfError(`Host "${host}" is not in BLINK_L402_HOST_ALLOWLIST.`);
   }
 
@@ -114,5 +202,77 @@ export async function assertSafeUrl(
         `Refusing L402 URL: host ${host} resolves to non-public address ${addr}.`,
       );
     }
+  }
+}
+
+const MAX_REDIRECT_HOPS = 5;
+
+// Headers that carry credentials and must not follow a redirect to another origin.
+const CREDENTIAL_HEADERS = ["authorization", "proxy-authorization", "cookie"];
+
+export interface SafeFetchOptions {
+  allowlist: Set<string>;
+  timeoutMs?: number;
+  maxHops?: number;
+}
+
+/**
+ * fetch() for untrusted L402 endpoints. Redirects are followed manually so
+ * every hop is re-validated with assertSafeUrl (HTTPS, host allowlist, public
+ * address) before any request is sent to it. Credential headers are dropped
+ * when a redirect changes origin, so an L402 token is never replayed to a host
+ * it was not issued for. Throws SsrfError on an unsafe hop or too many hops.
+ */
+export async function safeFetch(
+  rawUrl: string,
+  init: RequestInit,
+  { allowlist, timeoutMs = 15_000, maxHops = MAX_REDIRECT_HOPS }: SafeFetchOptions,
+): Promise<Response> {
+  await assertSafeUrl(rawUrl, allowlist);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let current = rawUrl;
+  let method = (init.method ?? "GET").toUpperCase();
+  let body = init.body;
+  const headers = new Headers(init.headers);
+
+  try {
+    for (let hop = 0; ; hop++) {
+      const res = await fetch(current, {
+        ...init,
+        method,
+        body,
+        headers,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+
+      const location = res.headers.get("location");
+      if (res.status < 300 || res.status >= 400 || !location) return res;
+
+      await res.body?.cancel().catch(() => {});
+      if (hop >= maxHops) {
+        throw new SsrfError(`Too many redirects (more than ${maxHops}) from ${rawUrl}.`);
+      }
+
+      const next = new URL(location, current).toString();
+      await assertSafeUrl(next, allowlist);
+
+      if (new URL(next).origin !== new URL(current).origin) {
+        for (const h of CREDENTIAL_HEADERS) headers.delete(h);
+      }
+      // Per the Fetch spec: 303 always, and 301/302 on POST, become a bodyless
+      // GET; 307/308 preserve method and body.
+      if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === "POST")) {
+        method = "GET";
+        body = undefined;
+        headers.delete("content-type");
+        headers.delete("content-length");
+      }
+      current = next;
+    }
+  } finally {
+    clearTimeout(timer);
   }
 }

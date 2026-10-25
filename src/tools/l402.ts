@@ -12,9 +12,14 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import type { BlinkClient } from "../client.js";
-import { assertSafeUrl, SsrfError } from "../security/ssrf.js";
+import { assertSafeUrl, safeFetch, SsrfError } from "../security/ssrf.js";
 import { loadSecurityConfig } from "../security/config.js";
-import { enforceAmount, type GuardContext } from "../security/guard.js";
+import {
+  enforceAmount,
+  reserveSpend,
+  settleReservation,
+  type GuardContext,
+} from "../security/guard.js";
 import { decodeBolt11AmountSats } from "../bolt11.js";
 
 // Re-exported for backwards compatibility (tests and callers import it here).
@@ -153,20 +158,9 @@ export function parseL402ProtocolBody(body: unknown): {
 }
 
 
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit,
-  timeoutMs = 15_000,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
+// Canonicalises the URL (token-cache key / reported canonicalUrl) by probing
+// redirects with HEAD. This is NOT the SSRF boundary: the real GET/POST requests
+// go through safeFetch(), which re-validates every hop of every request.
 async function resolveCanonicalUrl(
   url: string,
   allowlist: Set<string>,
@@ -193,7 +187,7 @@ async function resolveCanonicalUrl(
       }
       return current;
     }
-    return current;
+    throw new SsrfError(`Too many redirects (more than 5) from ${url}.`);
   } catch (err) {
     if (err instanceof SsrfError) throw err;
     return url;
@@ -215,16 +209,17 @@ async function fetchL402ProtocolInvoice(
   allowlist: Set<string>,
   timeoutMs = 15_000,
 ): Promise<{ invoice: string; offerId: string | null } | null> {
-  await assertSafeUrl(paymentRequestUrl, allowlist);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(paymentRequestUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-      signal: controller.signal,
-    });
+    // safeFetch validates the initial URL and every redirect hop.
+    const res = await safeFetch(
+      paymentRequestUrl,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      },
+      { allowlist, timeoutMs },
+    );
     if (!res.ok) return null;
     const data = (await res.json()) as Record<string, unknown>;
     const invoice = (data.invoice || data.payment_request || null) as
@@ -233,10 +228,10 @@ async function fetchL402ProtocolInvoice(
     return invoice
       ? { invoice, offerId: (data.offer_id as string | null) || null }
       : null;
-  } catch {
+  } catch (err) {
+    // A blocked hop must surface as such, not as an unparseable challenge.
+    if (err instanceof SsrfError) throw err;
     return null;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -661,6 +656,17 @@ export const l402Tools = {
 
 // ── Tool handlers ─────────────────────────────────────────────────────────────
 
+function requestFailed(err: unknown, url: string) {
+  return {
+    success: false,
+    error:
+      err instanceof SsrfError
+        ? `Blocked unsafe URL: ${err.message}`
+        : `Request failed: ${(err as Error).message}`,
+    url,
+  };
+}
+
 export async function handleL402Tool(
   client: BlinkClient,
   toolName: string,
@@ -678,28 +684,18 @@ export async function handleL402Tool(
       try {
         canonicalUrl = await resolveCanonicalUrl(url, l402Allowlist);
       } catch (err) {
-        return {
-          success: false,
-          error:
-            err instanceof SsrfError
-              ? `Blocked unsafe URL: ${err.message}`
-              : `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
 
       let res: Response;
       try {
-        res = await fetchWithTimeout(canonicalUrl, {
-          method,
-          headers: { Accept: "application/json" },
-        });
+        res = await safeFetch(
+          canonicalUrl,
+          { method, headers: { Accept: "application/json" } },
+          { allowlist: l402Allowlist },
+        );
       } catch (err) {
-        return {
-          success: false,
-          error: `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
 
       if (res.status !== 402) {
@@ -806,14 +802,7 @@ export async function handleL402Tool(
       try {
         canonicalUrl = await resolveCanonicalUrl(url, l402Allowlist);
       } catch (err) {
-        return {
-          success: false,
-          error:
-            err instanceof SsrfError
-              ? `Blocked unsafe URL: ${err.message}`
-              : `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
       const domain = extractDomain(canonicalUrl);
 
@@ -822,10 +811,19 @@ export async function handleL402Tool(
         const cached = getToken(domain);
         if (cached) {
           const authHeader = `L402 ${cached.macaroon}:${cached.preimage}`;
-          const res = await fetchWithTimeout(canonicalUrl, {
-            method,
-            headers: { Accept: "application/json", Authorization: authHeader },
-          });
+          let res: Response;
+          try {
+            res = await safeFetch(
+              canonicalUrl,
+              {
+                method,
+                headers: { Accept: "application/json", Authorization: authHeader },
+              },
+              { allowlist: l402Allowlist },
+            );
+          } catch (err) {
+            return requestFailed(err, url);
+          }
           const body = await res.text();
           let data: unknown;
           try {
@@ -864,16 +862,13 @@ export async function handleL402Tool(
       // Initial request
       let initialRes: Response;
       try {
-        initialRes = await fetchWithTimeout(canonicalUrl, {
-          method,
-          headers: { Accept: "application/json" },
-        });
+        initialRes = await safeFetch(
+          canonicalUrl,
+          { method, headers: { Accept: "application/json" } },
+          { allowlist: l402Allowlist },
+        );
       } catch (err) {
-        return {
-          success: false,
-          error: `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
 
       if (initialRes.status === 200) {
@@ -921,14 +916,7 @@ export async function handleL402Tool(
       try {
         challenge = await resolveL402Challenge(initialRes, l402Allowlist);
       } catch (err) {
-        return {
-          success: false,
-          error:
-            err instanceof SsrfError
-              ? `Blocked unsafe URL: ${err.message}`
-              : `Request failed: ${(err as Error).message}`,
-          url,
-        };
+        return requestFailed(err, url);
       }
       if (!challenge) {
         return {
@@ -1006,15 +994,55 @@ export async function handleL402Tool(
         };
       }
 
-      // Pay the invoice
+      // Reserve the decoded amount against the 24h budget atomically, right
+      // before paying, so concurrent spends cannot both pass the check above.
+      const reservation =
+        guard && satoshis !== null ? await reserveSpend(guard, satoshis, console.error) : null;
+      if (reservation && !reservation.ok) {
+        return {
+          success: false,
+          event: "l402_budget_exceeded",
+          url,
+          canonicalUrl: canonicalUrl !== url ? canonicalUrl : undefined,
+          satoshis,
+          message: reservation.reason,
+        };
+      }
+
+      // Pay the invoice. The reservation is committed on SUCCESS and released
+      // only when no new funds moved (FAILURE, ALREADY_PAID). Anything else
+      // (PENDING, unknown) may still settle, so the reservation stays pending
+      // and keeps counting — as it does when the call throws.
       const payResult = await client.payLnInvoice({
         walletId: wallet_id,
         paymentRequest: challenge.invoice,
       });
-
       const payResponse = payResult.lnInvoicePaymentSend;
+      const hasErrors =
+        !!payResponse.errors && (payResponse.errors as unknown[]).length > 0;
+      if (reservation?.ok) {
+        if (payResponse.status === "SUCCESS" && !hasErrors) {
+          await settleReservation(reservation.commit, console.error);
+        } else if (
+          payResponse.status === "FAILURE" ||
+          payResponse.status === "ALREADY_PAID"
+        ) {
+          await settleReservation(reservation.release, console.error);
+        }
+      }
 
-      if (payResponse.errors && (payResponse.errors as unknown[]).length > 0) {
+      if (payResponse.status === "PENDING") {
+        return {
+          success: false,
+          status: "pending",
+          url,
+          satoshis,
+          message:
+            "Payment is in flight and may still settle. Do NOT retry l402_pay for this URL: a retry fetches and pays a new invoice. The amount stays counted against the 24h budget.",
+        };
+      }
+
+      if (hasErrors) {
         return {
           success: false,
           error: `Payment failed: ${JSON.stringify(payResponse.errors)}`,
@@ -1031,12 +1059,6 @@ export async function handleL402Tool(
           error: `Payment not successful: status=${payResponse.status}`,
           url,
         };
-      }
-
-      // Debit the durable 24h budget only on a real, successful payment
-      // (status SUCCESS pays; ALREADY_PAID moved no new funds).
-      if (guard && satoshis !== null && payResponse.status === "SUCCESS") {
-        guard.ledger.record(satoshis);
       }
 
       // Extract preimage
@@ -1067,10 +1089,26 @@ export async function handleL402Tool(
 
       // Retry with payment proof
       const authHeader = `L402 ${macaroon}:${preimage}`;
-      const retryRes = await fetchWithTimeout(canonicalUrl, {
-        method,
-        headers: { Accept: "application/json", Authorization: authHeader },
-      });
+      let retryRes: Response;
+      try {
+        retryRes = await safeFetch(
+          canonicalUrl,
+          {
+            method,
+            headers: { Accept: "application/json", Authorization: authHeader },
+          },
+          { allowlist: l402Allowlist },
+        );
+      } catch (err) {
+        // The invoice is already paid and the token cached; a later call can
+        // reuse it once the resource is reachable.
+        return {
+          ...requestFailed(err, url),
+          event: "l402_paid_fetch_failed",
+          paymentStatus: payResponse.status,
+          satoshis: satoshis ?? null,
+        };
+      }
 
       const retryBody = await retryRes.text();
       let retryData: unknown;

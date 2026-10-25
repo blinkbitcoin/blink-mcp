@@ -140,9 +140,9 @@ describe("enforceAmount", () => {
     assert.equal(enforceAmount(c, 500).ok, true);
   });
 
-  test("denies over daily budget including prior spend", () => {
+  test("denies over daily budget including prior spend", async () => {
     const c = ctx({ dailyBudgetSats: 1000 });
-    c.ledger.record(800);
+    await c.ledger.record(800);
     assert.equal(enforceAmount(c, 300).ok, false);
     assert.equal(enforceAmount(c, 200).ok, true);
   });
@@ -151,9 +151,9 @@ describe("enforceAmount", () => {
 // ── evaluateSpend ──────────────────────────────────────────────────────────
 
 describe("evaluateSpend", () => {
-  test("denies recipient not in allowlist", () => {
+  test("denies recipient not in allowlist", async () => {
     const c = ctx({ recipientAllowlist: new Set(["good@blink.sv"]) });
-    const d = evaluateSpend(c, "pay_lightning_address", {
+    const d = await evaluateSpend(c, "pay_lightning_address", {
       amount: 100,
       recipient: "evil@attacker.com",
       isSweep: false,
@@ -161,9 +161,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("allowlisted recipient still requires confirmation", () => {
+  test("allowlisted recipient still requires confirmation", async () => {
     const c = ctx({ recipientAllowlist: new Set(["good@blink.sv"]) });
-    const d = evaluateSpend(c, "pay_lightning_address", {
+    const d = await evaluateSpend(c, "pay_lightning_address", {
       amount: 100,
       recipient: "GOOD@blink.sv",
       isSweep: false,
@@ -171,9 +171,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "confirm");
   });
 
-  test("denies known amount over cap even with confirmation off", () => {
+  test("denies known amount over cap even with confirmation off", async () => {
     const c = ctx({ maxPaymentSats: 500, requireConfirmation: false });
-    const d = evaluateSpend(c, "send_onchain", {
+    const d = await evaluateSpend(c, "send_onchain", {
       amount: 900,
       recipient: "bc1q",
       isSweep: false,
@@ -181,9 +181,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("unknown amount + cap + no confirmation => deny (never bypass)", () => {
+  test("unknown amount + cap + no confirmation => deny (never bypass)", async () => {
     const c = ctx({ maxPaymentSats: 500, requireConfirmation: false });
-    const d = evaluateSpend(c, "l402_pay", {
+    const d = await evaluateSpend(c, "l402_pay", {
       amount: null,
       recipient: "https://x",
       isSweep: false,
@@ -191,9 +191,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("pay_invoice: decoded amount over cap => deny (even with confirmation)", () => {
+  test("pay_invoice: decoded amount over cap => deny (even with confirmation)", async () => {
     const c = ctx({ maxPaymentSats: 500 });
-    const d = evaluateSpend(c, "pay_invoice", {
+    const d = await evaluateSpend(c, "pay_invoice", {
       amount: 900,
       recipient: "lnbc9u1p...",
       isSweep: false,
@@ -201,9 +201,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("pay_invoice: decoded amount within cap => confirm", () => {
+  test("pay_invoice: decoded amount within cap => confirm", async () => {
     const c = ctx({ maxPaymentSats: 5000 });
-    const d = evaluateSpend(c, "pay_invoice", {
+    const d = await evaluateSpend(c, "pay_invoice", {
       amount: 1000,
       recipient: "lnbc10u1p...",
       isSweep: false,
@@ -211,9 +211,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "confirm");
   });
 
-  test("pay_invoice: undecodable amount + cap => deny (never bypass)", () => {
+  test("pay_invoice: undecodable amount + cap => deny (never bypass)", async () => {
     const c = ctx({ maxPaymentSats: 500 });
-    const d = evaluateSpend(c, "pay_invoice", {
+    const d = await evaluateSpend(c, "pay_invoice", {
       amount: null,
       recipient: "bad-invoice",
       isSweep: false,
@@ -222,9 +222,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("send_onchain_all sweep + cap => deny (cannot verify)", () => {
+  test("send_onchain_all sweep + cap => deny (cannot verify)", async () => {
     const c = ctx({ maxPaymentSats: 100000 });
-    const d = evaluateSpend(c, "send_onchain_all", {
+    const d = await evaluateSpend(c, "send_onchain_all", {
       amount: null,
       recipient: "bc1q",
       isSweep: true,
@@ -232,9 +232,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("send_onchain_all sweep + daily budget => deny", () => {
+  test("send_onchain_all sweep + daily budget => deny", async () => {
     const c = ctx({ dailyBudgetSats: 100000 });
-    const d = evaluateSpend(c, "send_onchain_all", {
+    const d = await evaluateSpend(c, "send_onchain_all", {
       amount: null,
       recipient: "bc1q",
       isSweep: true,
@@ -242,9 +242,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "deny");
   });
 
-  test("send_onchain_all sweep + NO caps => confirm (unchanged)", () => {
+  test("send_onchain_all sweep + NO caps => confirm (unchanged)", async () => {
     const c = ctx({});
-    const d = evaluateSpend(c, "send_onchain_all", {
+    const d = await evaluateSpend(c, "send_onchain_all", {
       amount: null,
       recipient: "bc1q",
       isSweep: true,
@@ -252,9 +252,9 @@ describe("evaluateSpend", () => {
     assert.equal(d.action, "confirm");
   });
 
-  test("allows when confirmation disabled and within caps", () => {
+  test("allows when confirmation disabled and within caps", async () => {
     const c = ctx({ requireConfirmation: false, maxPaymentSats: 1000 });
-    const d = evaluateSpend(c, "send_onchain", {
+    const d = await evaluateSpend(c, "send_onchain", {
       amount: 500,
       recipient: "bc1q",
       isSweep: false,
@@ -371,32 +371,32 @@ describe("hashArgs", () => {
 // ── durable ledger ──────────────────────────────────────────────────────────
 
 describe("SpendLedger", () => {
-  test("persists across instances (survives restart)", () => {
+  test("persists across instances (survives restart)", async () => {
     const file = memLedgerFile();
     const l1 = new SpendLedger(file);
-    l1.record(300);
-    l1.record(200);
+    await l1.record(300);
+    await l1.record(200);
     // New instance simulates a server restart.
     const l2 = new SpendLedger(file);
     assert.equal(l2.spentLast24h(), 500);
   });
 
-  test("prunes entries older than 24h", () => {
+  test("prunes entries older than 24h", async () => {
     const file = memLedgerFile();
     let now = 1_000_000_000_000;
     const l = new SpendLedger(file, () => now);
-    l.record(1000);
+    await l.record(1000);
     now += 25 * 60 * 60 * 1000; // +25h
     assert.equal(l.spentLast24h(), 0);
   });
 
-  test("writes a 0600 file", (t) => {
+  test("writes a 0600 file", async (t) => {
     if (process.platform === "win32") {
       t.skip("POSIX perms n/a on Windows");
       return;
     }
     const file = memLedgerFile();
-    new SpendLedger(file).record(10);
+    await new SpendLedger(file).record(10);
     const mode = fs.statSync(file).mode & 0o777;
     assert.equal(mode, 0o600);
   });
@@ -422,6 +422,17 @@ describe("checkWebhookUrl", () => {
   });
   test("accepts any https host when allowlist empty", () => {
     assert.equal(checkWebhookUrl("https://anywhere.example/cb", new Set()).ok, true);
+  });
+  test("rejects IP-literal and localhost hosts", () => {
+    for (const u of [
+      "https://127.0.0.1/cb",
+      "https://8.8.8.8/cb",
+      "https://[::1]/cb",
+      "https://localhost/cb",
+      "https://foo.localhost/cb",
+    ]) {
+      assert.equal(checkWebhookUrl(u, new Set()).ok, false, u);
+    }
   });
 });
 

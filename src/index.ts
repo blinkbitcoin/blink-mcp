@@ -30,13 +30,11 @@ import { l402Tools, handleL402Tool } from "./tools/l402.js";
 import { toolInputJsonSchema } from "./schema.js";
 import { loadSecurityConfig } from "./security/config.js";
 import {
-  isSpendTool,
-  extractSpendIntent,
-  evaluateSpend,
-  confirmSpend,
+  requiresGuard,
   ApprovalCodeStore,
   type GuardContext,
 } from "./security/guard.js";
+import { runGuarded, type ApprovalKind } from "./security/gate.js";
 import { SpendLedger } from "./security/ledger.js";
 import { createRequire } from "node:module";
 
@@ -92,17 +90,6 @@ const allTools = {
   ...webhookTools,
   ...l402Tools,
 };
-
-// A spend handler result counts as successful when it returns { success: true }.
-// Used to decide whether to debit the durable 24h budget (Fix 6: never debit on
-// a failed/rejected payment).
-function isSuccessfulSpend(result: unknown): boolean {
-  return (
-    typeof result === "object" &&
-    result !== null &&
-    (result as { success?: unknown }).success === true
-  );
-}
 
 // Route tool calls to appropriate handler
 async function handleToolCall(
@@ -173,13 +160,24 @@ async function main() {
   const guardCtx: GuardContext = {
     config: securityConfig,
     ledger: new SpendLedger(), // durable, survives restarts
+    // USD-wallet amounts are in cents; convert at Blink's current rate so they
+    // are checked against the sat-denominated caps and budget.
+    toSats: async (cents: number) => {
+      const res = await blinkClient.getCurrencyConversion(cents / 100, "USD");
+      const sats = (res.currencyConversionEstimation as { btcSatAmount?: unknown })
+        ?.btcSatAmount;
+      if (typeof sats !== "number") {
+        throw new Error("currency conversion returned no btcSatAmount");
+      }
+      return sats;
+    },
   };
   const approvals = new ApprovalCodeStore();
   // Approval codes are written to stderr (not the MCP stdout channel), so they
   // are visible to the human operator's console but never enter model context.
   const printToStderr = (line: string): void => console.error(line);
 
-  // In stderr-code mode, advertise the optional approval_code field on spend
+  // In stderr-code mode, advertise the optional approval_code field on guarded
   // tools so schema-validating clients can send it as part of the contract.
   const advertiseApprovalCode =
     securityConfig.requireConfirmation &&
@@ -189,7 +187,7 @@ async function main() {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools = Object.entries(allTools).map(([name, def]) => {
       const inputSchema = toolInputJsonSchema(def.inputSchema);
-      if (advertiseApprovalCode && isSpendTool(name)) {
+      if (advertiseApprovalCode && requiresGuard(name)) {
         const props =
           (inputSchema.properties as Record<string, unknown>) ?? {};
         props.approval_code = {
@@ -229,126 +227,49 @@ async function main() {
         unknown
       >;
 
-      // ── Spend guard ──────────────────────────────────────────────────────
-      // Every money-moving tool passes allowlist + caps + budget + confirmation
-      // before it can execute. Fails closed. For known-amount tools we also
-      // debit the durable 24h budget, but only after a successful payment.
-      let debitOnSuccess: number | null = null;
-      if (isSpendTool(name)) {
-        const intent = extractSpendIntent(name, validatedArgs);
-        const decision = evaluateSpend(guardCtx, name, intent);
-
-        if (decision.action === "deny") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({ success: false, error: decision.reason }),
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        if (decision.action === "confirm") {
-          // approval_code (stderr-code mode) travels alongside validated args;
-          // Zod may strip it, so also read it from the raw request.
-          const rawArgs = toolArgs as Record<string, unknown>;
-          const confirmArgs = {
-            ...validatedArgs,
-            approval_code:
-              (validatedArgs as Record<string, unknown>).approval_code ??
-              rawArgs.approval_code,
-          };
-
-          // Inline elicitation when the client supports it; otherwise the guard
-          // applies the configured fallback (fail-closed or stderr-code).
-          const caps = server.getClientCapabilities();
-          const supportsElicitation = Boolean(caps?.elicitation);
-          const elicit = supportsElicitation
-            ? async (summary: string): Promise<boolean> => {
-                const res = await server.elicitInput({
-                  message: `Approve this payment?\n\n${summary}\n\nThis moves real funds and cannot be undone.`,
-                  requestedSchema: {
-                    type: "object",
-                    properties: {
-                      approve: {
-                        type: "boolean",
-                        description: "Set true to authorize this payment.",
-                      },
-                    },
-                    required: ["approve"],
+      // ── Guard ────────────────────────────────────────────────────────────
+      // Every money-moving tool passes allowlist + caps + budget + confirmation,
+      // and webhook-changing tools pass the webhook policy + confirmation,
+      // before they can execute. Fails closed. See src/security/gate.ts.
+      const caps = server.getClientCapabilities();
+      const elicit = caps?.elicitation
+        ? async (summary: string, kind: ApprovalKind): Promise<boolean> => {
+            const res = await server.elicitInput({
+              message:
+                kind === "payment"
+                  ? `Approve this payment?\n\n${summary}\n\nThis moves real funds and cannot be undone.`
+                  : `Approve this account change?\n\n${summary}`,
+              requestedSchema: {
+                type: "object",
+                properties: {
+                  approve: {
+                    type: "boolean",
+                    description:
+                      kind === "payment"
+                        ? "Set true to authorize this payment."
+                        : "Set true to authorize this change.",
                   },
-                });
-                return res.action === "accept" && res.content?.approve === true;
-              }
-            : null;
-
-          const confirmation = await confirmSpend(
-            { elicit, approvals, printToStderr, approvalMode: securityConfig.approvalMode },
-            name,
-            confirmArgs,
-            decision.summary,
-          );
-
-          if (confirmation.status === "rejected") {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    success: false,
-                    error: confirmation.reason,
-                  }),
                 },
-              ],
-              isError: true,
-            };
+                required: ["approve"],
+              },
+            });
+            return res.action === "accept" && res.content?.approve === true;
           }
+        : null;
 
-          if (confirmation.status === "pending") {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify(confirmation.payload, null, 2),
-                },
-              ],
-            };
-          }
-          // approved → fall through to execution
-        }
-
-        // Known-amount, non-sweep spends debit the shared budget on success.
-        // (l402_pay records its own decoded amount inside the handler; sweeps
-        // have no known amount to debit.)
-        if (intent.amount !== null && !intent.isSweep && name !== "l402_pay") {
-          debitOnSuccess = intent.amount;
-        }
-      }
-
-      // Execute the tool
-      const result = await handleToolCall(
-        blinkClient,
+      return await runGuarded(
         name,
         validatedArgs,
-        guardCtx,
+        toolArgs,
+        {
+          guardCtx,
+          approvals,
+          printToStderr,
+          approvalMode: securityConfig.approvalMode,
+          elicit,
+        },
+        () => handleToolCall(blinkClient, name, validatedArgs, guardCtx),
       );
-
-      // Debit the durable 24h budget only when the payment actually succeeded
-      // (handler returned { success: true }). Failed attempts never burn budget.
-      if (debitOnSuccess !== null && isSuccessfulSpend(result)) {
-        guardCtx.ledger.record(debitOnSuccess);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
     } catch (error) {
       // Handle Zod validation errors
       if (error instanceof z.ZodError) {

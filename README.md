@@ -278,14 +278,15 @@ agent processing untrusted content (a web page, email, invoice memo, etc.) could
 be steered into making a payment via indirect prompt injection. To mitigate
 this, every money-moving tool passes through a central **spend guard** before it
 executes, enforcing (in order): recipient allowlist → per-transaction cap →
-rolling 24h budget → **human confirmation**.
+rolling 24h budget → **human confirmation**. Webhook changes (`add_webhook`,
+`remove_webhook`) pass through the same confirmation step.
 
-The guard is **safe-by-default**: with no configuration, all spend tools require
-explicit confirmation before running.
+The guard is **safe-by-default**: with no configuration, all spend tools and
+webhook changes require explicit confirmation before running.
 
 | Variable | Default | Effect |
 | -------- | ------- | ------ |
-| `BLINK_REQUIRE_CONFIRMATION` | `true` | Require confirmation before any spend |
+| `BLINK_REQUIRE_CONFIRMATION` | `true` | Require confirmation before any spend or webhook change |
 | `BLINK_APPROVAL_MODE` | `fail-closed` | Fallback when the client can't do elicitation: `fail-closed` or `stderr-code` |
 | `BLINK_MAX_PAYMENT_SATS` | _(none)_ | Per-transaction cap in sats (authoritative for all spends, incl. `l402_pay`) |
 | `BLINK_DAILY_BUDGET_SATS` | _(none)_ | Rolling 24h spend cap in sats (durable across restarts) |
@@ -312,11 +313,24 @@ fallback:
 **Amount enforcement.** `BLINK_MAX_PAYMENT_SATS` and `BLINK_DAILY_BUDGET_SATS`
 are enforced for every spend tool. Fixed-amount Lightning invoices are decoded
 from the bolt11 before payment so `pay_invoice` is subject to the same caps and
-budget as amount-carrying tools. For `l402_pay`, whose amount is only known
-after fetching the invoice, the caps are re-checked *after decoding* and before
-payment. The 24h budget is debited only on a **successful** payment (failed
-attempts never burn budget) and is persisted to a `0600` ledger at
-`~/.blink/spend-ledger.json` so it survives restarts.
+budget as amount-carrying tools. USD-wallet amounts (`send_onchain_usd`,
+`send_to_wallet_usd`, `send_to_username` with `wallet_currency: "USD"`) are in
+cents; when a cap or budget is configured they are converted to sats at Blink's
+current rate before being checked against it, and refused if the conversion
+fails. For `l402_pay`, whose amount is only known after fetching the
+invoice, the caps are re-checked *after decoding* and before payment.
+
+The 24h budget is reserved atomically right before a payment executes, so
+concurrent calls cannot overspend it. The reservation is released when the
+payment definitely **fails** (failed attempts never burn budget) and kept when it
+succeeds — or when the outcome is unknown (e.g. a timeout or a `PENDING`
+payment), since the funds may have moved. It is persisted to a `0600` ledger at
+`~/.blink/spend-ledger.json` so it survives restarts; the ledger is locked
+against concurrent server processes, written atomically, and if it becomes
+unreadable spends are refused (while a budget is configured) rather than the
+budget silently resetting. A lock file left behind by a hard-killed process
+(`~/.blink/spend-ledger.json.lock`) is never removed automatically; spends are
+refused with an error naming the file until you delete it.
 
 **Sweeps and undecodable amounts.** When a per-transaction cap or daily budget
 is configured, `send_onchain_all` (full-balance sweep) and any `pay_invoice`
@@ -328,13 +342,22 @@ With no caps configured, these still require confirmation.
 (`max_amount_sats` or `BLINK_L402_MAX_SATS`) plus the global caps above, and
 refuses invoices whose amount cannot be decoded. Server-side L402 fetches
 **require `BLINK_L402_HOST_ALLOWLIST`** (fail-closed when unset), are HTTPS-only,
-reject private/loopback/link-local addresses, and re-validate every redirect
-hop — mitigating DNS-rebinding SSRF without socket pinning. Cached L402 tokens
+and reject private, loopback, link-local and other non-public addresses
+(including IPv4 embedded in IPv6). Redirects are followed manually and every hop
+of every L402 request (the HEAD probe, the resource GET, and the l402-protocol
+invoice POST) is re-validated before it is sent; credentials are dropped when a
+redirect changes origin. Sockets are not pinned to the checked address, so DNS
+rebinding is not fully closed: the host allowlist limits that exposure to hosts
+you trust, so only allowlist hosts whose DNS you trust. Cached L402 tokens
 are stored `0600`, and `l402_store get` masks payment secrets unless called
 with `reveal: true`.
 
-**Webhooks.** `add_webhook` requires an HTTPS URL and, when
-`BLINK_WEBHOOK_ALLOWLIST` is set, a listed hostname.
+**Webhooks.** A webhook receives a notification for every payment on the
+account, so registering one is treated like a spend: `add_webhook` and
+`remove_webhook` require human confirmation (same flow as above).
+`add_webhook` also requires an HTTPS URL with a DNS hostname (IP literals and
+`localhost` are rejected) and, when `BLINK_WEBHOOK_ALLOWLIST` is set, a listed
+hostname.
 
 ## Troubleshooting
 
