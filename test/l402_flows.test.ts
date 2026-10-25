@@ -392,6 +392,30 @@ describe("l402_pay", () => {
     assert.equal(g.ledger.spentLast24h(), 0);
   });
 
+  test("a PENDING payment keeps its reservation, so the next spend near the limit is refused", async () => {
+    route({ [`GET ${ORIGIN}/res`]: challenge402 });
+    const g = guard({ dailyBudgetSats: 1500 });
+    const first = await pay(fakeClient("PENDING").client, g);
+    assert.equal(first.success, false);
+    assert.equal(first.status, "pending");
+    assert.match(String(first.message), /Do NOT retry/);
+    assert.equal(g.ledger.spentLast24h(), 1000);
+
+    const { client, calls } = fakeClient();
+    const second = await pay(client, g);
+    assert.equal(second.event, "l402_budget_exceeded");
+    assert.equal(calls.pay, 0);
+    assert.equal(g.ledger.spentLast24h(), 1000);
+  });
+
+  test("errors without a FAILURE status keep the reservation (outcome unknown)", async () => {
+    route({ [`GET ${ORIGIN}/res`]: challenge402 });
+    const g = guard({ dailyBudgetSats: 5000 });
+    const r = await pay(fakeClient("UNKNOWN", { errors: [{ message: "timeout" }] }).client, g);
+    assert.match(String(r.error), /Payment failed/);
+    assert.equal(g.ledger.spentLast24h(), 1000);
+  });
+
   test("a throwing payment call keeps the reservation pending (outcome unknown)", async () => {
     route({ [`GET ${ORIGIN}/res`]: challenge402 });
     const g = guard({ dailyBudgetSats: 5000 });

@@ -1009,23 +1009,40 @@ export async function handleL402Tool(
         };
       }
 
-      // Pay the invoice. The reservation is committed only on a real,
-      // successful payment (status SUCCESS pays; ALREADY_PAID moved no new
-      // funds) and released on a definite failure. If the call throws, the
-      // outcome is unknown, so the reservation stays pending and keeps counting.
+      // Pay the invoice. The reservation is committed on SUCCESS and released
+      // only when no new funds moved (FAILURE, ALREADY_PAID). Anything else
+      // (PENDING, unknown) may still settle, so the reservation stays pending
+      // and keeps counting — as it does when the call throws.
       const payResult = await client.payLnInvoice({
         walletId: wallet_id,
         paymentRequest: challenge.invoice,
       });
       const payResponse = payResult.lnInvoicePaymentSend;
+      const hasErrors =
+        !!payResponse.errors && (payResponse.errors as unknown[]).length > 0;
       if (reservation?.ok) {
-        const paid =
-          !(payResponse.errors && (payResponse.errors as unknown[]).length > 0) &&
-          payResponse.status === "SUCCESS";
-        await settleReservation(paid ? reservation.commit : reservation.release, console.error);
+        if (payResponse.status === "SUCCESS" && !hasErrors) {
+          await settleReservation(reservation.commit, console.error);
+        } else if (
+          payResponse.status === "FAILURE" ||
+          payResponse.status === "ALREADY_PAID"
+        ) {
+          await settleReservation(reservation.release, console.error);
+        }
       }
 
-      if (payResponse.errors && (payResponse.errors as unknown[]).length > 0) {
+      if (payResponse.status === "PENDING") {
+        return {
+          success: false,
+          status: "pending",
+          url,
+          satoshis,
+          message:
+            "Payment is in flight and may still settle. Do NOT retry l402_pay for this URL: a retry fetches and pays a new invoice. The amount stays counted against the 24h budget.",
+        };
+      }
+
+      if (hasErrors) {
         return {
           success: false,
           error: `Payment failed: ${JSON.stringify(payResponse.errors)}`,
