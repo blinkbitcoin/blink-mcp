@@ -370,29 +370,39 @@ describe("SpendLedger hardening", () => {
     assert.deepEqual(fs.readdirSync(path.dirname(file)), ["spend-ledger.json"]);
   });
 
-  test("an unreadable lock is broken only once it is old", async () => {
+  test("an unreadable lock is never broken, however old", async () => {
     const file = tmpLedgerFile();
     const lock = `${file}.lock`;
     fs.writeFileSync(lock, "");
-    const old = new Date(Date.now() - 60_000);
+    const old = new Date(Date.now() - 60 * 60_000);
     fs.utimesSync(lock, old, old);
-    const l = new SpendLedger(file);
-    await l.record(5);
-    assert.equal(l.spentLast24h(), 5);
-
-    fs.writeFileSync(lock, ""); // fresh, owner may still be writing it
-    await assert.rejects(() => l.record(5), /Timed out waiting for spend ledger lock/);
+    await assert.rejects(
+      () => new SpendLedger(file).record(5),
+      /Timed out waiting for spend ledger lock .*remove the lock file/,
+    );
+    assert.equal(fs.readFileSync(lock, "utf8"), "");
     fs.rmSync(lock);
   });
 
-  test("a lock whose owner process is gone is broken immediately", async () => {
+  test("a lock left by a dead process refuses at once and is left in place", async () => {
     const file = tmpLedgerFile();
+    const lock = `${file}.lock`;
     const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
-    fs.writeFileSync(`${file}.lock`, `${deadPid}:tok`);
+    fs.writeFileSync(lock, `${deadPid}:tok`);
     const l = new SpendLedger(file);
+    const started = Date.now();
+    await assert.rejects(
+      () => l.reserve(7, 1000),
+      new RegExp(`no longer running \\(pid ${deadPid}\\).*remove the lock file`),
+    );
+    assert.ok(Date.now() - started < 1000, "should not wait for the lock timeout");
+    assert.equal(fs.readFileSync(lock, "utf8"), `${deadPid}:tok`);
+    assert.equal(fs.existsSync(file), false, "nothing was written");
+
+    // Once the operator removes the lock, spending resumes.
+    fs.rmSync(lock);
     await l.record(7);
     assert.equal(l.spentLast24h(), 7);
-    assert.equal(fs.existsSync(`${file}.lock`), false);
   });
 
   test("a live owner's lock is never broken, however old", async () => {
@@ -406,68 +416,24 @@ describe("SpendLedger hardening", () => {
     fs.rmSync(lock);
   });
 
-  test("breaking a stale lock restores a live lock created in the meantime", async (t) => {
+  test("waiters never rename or unlink another process's lock", async (t) => {
     const file = tmpLedgerFile();
     const lock = `${file}.lock`;
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
-    fs.writeFileSync(lock, `${deadPid}:stale`);
-    // Another waiter breaks the stale lock and takes its own just before our
-    // rename: our rename then moves THEIR lock, which must be put back.
-    const realRename = fs.renameSync;
-    let raced = false;
-    t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
-      if (!raced && from === lock) {
-        raced = true;
-        fs.writeFileSync(lock, `${process.pid}:winner`);
-      }
-      return realRename(from, to);
+    fs.writeFileSync(lock, `${process.pid}:live-owner`);
+    const touched: string[] = [];
+    t.mock.method(fs, "renameSync", (from: fs.PathLike) => {
+      touched.push(`rename ${String(from)}`);
+      throw new Error("unexpected rename");
+    });
+    const realRm = fs.rmSync;
+    t.mock.method(fs, "rmSync", (p: fs.PathLike, o?: fs.RmOptions) => {
+      if (String(p) === lock) touched.push(`rm ${String(p)}`);
+      return realRm(p, o);
     });
     await assert.rejects(() => new SpendLedger(file).record(1), /Timed out/);
-    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:winner`);
-    fs.rmSync(lock);
-  });
-
-  test("a stale lock that vanishes before it is moved aside is simply retried", async (t) => {
-    const file = tmpLedgerFile();
-    const lock = `${file}.lock`;
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
-    fs.writeFileSync(lock, `${deadPid}:stale`);
-    const realRename = fs.renameSync;
-    let raced = false;
-    t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
-      if (!raced && from === lock) {
-        raced = true;
-        fs.rmSync(lock); // another waiter removed it first
-      }
-      return realRename(from, to);
-    });
-    const l = new SpendLedger(file);
-    await l.record(3);
-    assert.equal(l.spentLast24h(), 3);
-  });
-
-  test("when a third lock appears during the restore, it is left in place", async (t) => {
-    const file = tmpLedgerFile();
-    const lock = `${file}.lock`;
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid!;
-    fs.writeFileSync(lock, `${deadPid}:stale`);
-    const realRename = fs.renameSync;
-    const realLink = fs.linkSync;
-    let raced = false;
-    t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
-      if (!raced && from === lock) {
-        raced = true;
-        fs.writeFileSync(lock, `${process.pid}:second`); // moved aside by our rename
-      }
-      return realRename(from, to);
-    });
-    t.mock.method(fs, "linkSync", (from: fs.PathLike, to: fs.PathLike) => {
-      fs.writeFileSync(lock, `${process.pid}:third`); // created before we restore
-      return realLink(from, to);
-    });
-    await assert.rejects(() => new SpendLedger(file).record(1), /Timed out/);
-    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:third`);
-    assert.deepEqual(fs.readdirSync(path.dirname(file)), ["spend-ledger.json.lock"]);
+    assert.deepEqual(touched, []);
+    assert.equal(fs.readFileSync(lock, "utf8"), `${process.pid}:live-owner`);
+    t.mock.restoreAll();
     fs.rmSync(lock);
   });
 

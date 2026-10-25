@@ -323,12 +323,14 @@ invoice, the caps are re-checked *after decoding* and before payment.
 The 24h budget is reserved atomically right before a payment executes, so
 concurrent calls cannot overspend it. The reservation is released when the
 payment definitely **fails** (failed attempts never burn budget) and kept when it
-succeeds — or when the outcome is unknown (e.g. a timeout), since the funds may
-have moved. It is persisted to a `0600` ledger at
+succeeds — or when the outcome is unknown (e.g. a timeout or a `PENDING`
+payment), since the funds may have moved. It is persisted to a `0600` ledger at
 `~/.blink/spend-ledger.json` so it survives restarts; the ledger is locked
 against concurrent server processes, written atomically, and if it becomes
 unreadable spends are refused (while a budget is configured) rather than the
-budget silently resetting.
+budget silently resetting. A lock file left behind by a hard-killed process
+(`~/.blink/spend-ledger.json.lock`) is never removed automatically; spends are
+refused with an error naming the file until you delete it.
 
 **Sweeps and undecodable amounts.** When a per-transaction cap or daily budget
 is configured, `send_onchain_all` (full-balance sweep) and any `pay_invoice`
