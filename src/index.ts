@@ -27,6 +27,7 @@ import {
   setSubscriptionCallback,
 } from "./tools/webhooks.js";
 import { l402Tools, handleL402Tool } from "./tools/l402.js";
+import { toolInputJsonSchema } from "./schema.js";
 import { loadSecurityConfig } from "./security/config.js";
 import {
   isSpendTool,
@@ -91,92 +92,6 @@ const allTools = {
   ...webhookTools,
   ...l402Tools,
 };
-
-// Convert Zod schema to JSON Schema for MCP
-function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
-  // Handle ZodObject
-  if (schema instanceof z.ZodObject) {
-    const shape = schema.shape;
-    const properties: Record<string, unknown> = {};
-    const required: string[] = [];
-
-    for (const [key, value] of Object.entries(shape)) {
-      const zodValue = value as z.ZodType;
-      properties[key] = zodFieldToJsonSchema(zodValue);
-
-      // Check if field is required (not optional)
-      if (
-        !(zodValue instanceof z.ZodOptional) &&
-        !(zodValue instanceof z.ZodDefault)
-      ) {
-        required.push(key);
-      }
-    }
-
-    return {
-      type: "object",
-      properties,
-      required: required.length > 0 ? required : undefined,
-    };
-  }
-
-  return { type: "object", properties: {} };
-}
-
-function zodFieldToJsonSchema(schema: z.ZodType): Record<string, unknown> {
-  // Handle optional
-  if (schema instanceof z.ZodOptional) {
-    return zodFieldToJsonSchema(schema.unwrap());
-  }
-
-  // Handle default
-  if (schema instanceof z.ZodDefault) {
-    const inner = zodFieldToJsonSchema(schema._def.innerType);
-    return { ...inner, default: schema._def.defaultValue() };
-  }
-
-  // Handle string
-  if (schema instanceof z.ZodString) {
-    const result: Record<string, unknown> = { type: "string" };
-    if (schema.description) result.description = schema.description;
-    return result;
-  }
-
-  // Handle number
-  if (schema instanceof z.ZodNumber) {
-    const result: Record<string, unknown> = { type: "number" };
-    if (schema.description) result.description = schema.description;
-    return result;
-  }
-
-  // Handle boolean
-  if (schema instanceof z.ZodBoolean) {
-    const result: Record<string, unknown> = { type: "boolean" };
-    if (schema.description) result.description = schema.description;
-    return result;
-  }
-
-  // Handle enum
-  if (schema instanceof z.ZodEnum) {
-    return {
-      type: "string",
-      enum: schema._def.values,
-      description: schema.description,
-    };
-  }
-
-  // Handle array
-  if (schema instanceof z.ZodArray) {
-    return {
-      type: "array",
-      items: zodFieldToJsonSchema(schema._def.type),
-      description: schema.description,
-    };
-  }
-
-  // Default
-  return { type: "string" };
-}
 
 // A spend handler result counts as successful when it returns { success: true }.
 // Used to decide whether to debit the durable 24h budget (Fix 6: never debit on
@@ -273,7 +188,7 @@ async function main() {
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools = Object.entries(allTools).map(([name, def]) => {
-      const inputSchema = zodToJsonSchema(def.inputSchema);
+      const inputSchema = toolInputJsonSchema(def.inputSchema);
       if (advertiseApprovalCode && isSpendTool(name)) {
         const props =
           (inputSchema.properties as Record<string, unknown>) ?? {};
@@ -437,7 +352,7 @@ async function main() {
     } catch (error) {
       // Handle Zod validation errors
       if (error instanceof z.ZodError) {
-        const messages = error.errors
+        const messages = error.issues
           .map((e) => `${e.path.join(".")}: ${e.message}`)
           .join("; ");
         return {

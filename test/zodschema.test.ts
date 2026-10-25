@@ -1,186 +1,105 @@
 /**
- * Tests for zodToJsonSchema / zodFieldToJsonSchema converters.
- *
- * These functions live in src/index.ts as module-level helpers.
- * We re-implement them here as thin copies so they can be tested in isolation
- * without spinning up the MCP server (which calls process.exit if BLINK_API_KEY
- * is not set).
- *
- * The tests verify the JSON Schema output that the server sends to MCP clients.
+ * Tests for toolInputJsonSchema (src/schema.ts): the JSON Schema the server
+ * advertises to MCP clients in tools/list.
  */
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { z } from "zod";
 
-// ── Inline re-implementation (must stay in sync with src/index.ts) ─────────────
+import { toolInputJsonSchema } from "../src/schema.js";
+import { walletTools } from "../src/tools/wallet.js";
+import { lightningTools } from "../src/tools/lightning.js";
+import { onchainTools } from "../src/tools/onchain.js";
+import { intraledgerTools } from "../src/tools/intraledger.js";
+import { webhookTools } from "../src/tools/webhooks.js";
+import { l402Tools } from "../src/tools/l402.js";
 
-function zodFieldToJsonSchema(schema: z.ZodType): Record<string, unknown> {
-  if (schema instanceof z.ZodOptional) {
-    return zodFieldToJsonSchema(schema.unwrap());
-  }
-  if (schema instanceof z.ZodDefault) {
-    const inner = zodFieldToJsonSchema(schema._def.innerType);
-    return { ...inner, default: schema._def.defaultValue() };
-  }
-  if (schema instanceof z.ZodString) {
-    const result: Record<string, unknown> = { type: "string" };
-    if (schema.description) result.description = schema.description;
-    return result;
-  }
-  if (schema instanceof z.ZodNumber) {
-    const result: Record<string, unknown> = { type: "number" };
-    if (schema.description) result.description = schema.description;
-    return result;
-  }
-  if (schema instanceof z.ZodBoolean) {
-    const result: Record<string, unknown> = { type: "boolean" };
-    if (schema.description) result.description = schema.description;
-    return result;
-  }
-  if (schema instanceof z.ZodEnum) {
-    return {
-      type: "string",
-      enum: schema._def.values,
-      description: schema.description,
-    };
-  }
-  if (schema instanceof z.ZodArray) {
-    return {
-      type: "array",
-      items: zodFieldToJsonSchema(schema._def.type),
-      description: schema.description,
-    };
-  }
-  return { type: "string" };
-}
+const props = (s: Record<string, unknown>) =>
+  s.properties as Record<string, Record<string, unknown>>;
 
-function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
-  if (schema instanceof z.ZodObject) {
-    const shape = schema.shape;
-    const properties: Record<string, unknown> = {};
-    const required: string[] = [];
-
-    for (const [key, value] of Object.entries(shape)) {
-      const zodValue = value as z.ZodType;
-      properties[key] = zodFieldToJsonSchema(zodValue);
-      if (
-        !(zodValue instanceof z.ZodOptional) &&
-        !(zodValue instanceof z.ZodDefault)
-      ) {
-        required.push(key);
-      }
-    }
-
-    return {
-      type: "object",
-      properties,
-      required: required.length > 0 ? required : undefined,
-    };
-  }
-  return { type: "object", properties: {} };
-}
-
-// ── Tests ──────────────────────────────────────────────────────────────────────
-
-describe("zodToJsonSchema", () => {
+describe("toolInputJsonSchema", () => {
   test("empty object schema", () => {
-    const schema = z.object({});
-    const result = zodToJsonSchema(schema);
-    assert.equal(result.type, "object");
-    assert.deepEqual(result.properties, {});
-    assert.equal(result.required, undefined);
+    assert.deepEqual(toolInputJsonSchema(z.object({})), {
+      type: "object",
+      properties: {},
+    });
   });
 
-  test("required string field appears in required array", () => {
-    const schema = z.object({ name: z.string() });
-    const result = zodToJsonSchema(schema);
+  test("drops the $schema keyword", () => {
+    assert.equal(toolInputJsonSchema(z.object({})).$schema, undefined);
+  });
+
+  test("required string field with description", () => {
+    const result = toolInputJsonSchema(
+      z.object({ name: z.string().describe("a wallet id") }),
+    );
     assert.deepEqual(result.required, ["name"]);
-    assert.deepEqual((result.properties as Record<string, unknown>).name, {
-      type: "string",
-    });
-  });
-
-  test("optional field is NOT in required array", () => {
-    const schema = z.object({
-      name: z.string(),
-      memo: z.string().optional(),
-    });
-    const result = zodToJsonSchema(schema);
-    assert.deepEqual(result.required, ["name"]);
-  });
-
-  test("field with .default() is NOT in required array", () => {
-    const schema = z.object({
-      limit: z.number().int().default(20),
-    });
-    const result = zodToJsonSchema(schema);
-    assert.equal(result.required, undefined);
-    const limitField = (result.properties as Record<string, unknown>)
-      .limit as Record<string, unknown>;
-    assert.equal(limitField.default, 20);
-    assert.equal(limitField.type, "number");
-  });
-
-  test("non-object schema falls back to {type: object, properties: {}}", () => {
-    const result = zodToJsonSchema(z.string());
-    assert.deepEqual(result, { type: "object", properties: {} });
-  });
-});
-
-describe("zodFieldToJsonSchema", () => {
-  test("string", () => {
-    assert.deepEqual(zodFieldToJsonSchema(z.string()), { type: "string" });
-  });
-
-  test("string with description", () => {
-    assert.deepEqual(zodFieldToJsonSchema(z.string().describe("a wallet id")), {
+    assert.deepEqual(props(result).name, {
       type: "string",
       description: "a wallet id",
     });
   });
 
-  test("number", () => {
-    assert.deepEqual(zodFieldToJsonSchema(z.number()), { type: "number" });
+  test("optional field is NOT required", () => {
+    const result = toolInputJsonSchema(
+      z.object({ name: z.string(), cursor: z.string().optional() }),
+    );
+    assert.deepEqual(result.required, ["name"]);
+    assert.deepEqual(props(result).cursor, { type: "string" });
   });
 
-  test("boolean", () => {
-    assert.deepEqual(zodFieldToJsonSchema(z.boolean()), { type: "boolean" });
+  test("field with .default() is NOT required and carries the default", () => {
+    const result = toolInputJsonSchema(
+      z.object({ limit: z.number().min(1).max(100).default(20) }),
+    );
+    assert.equal(result.required, undefined);
+    assert.equal(props(result).limit.type, "number");
+    assert.equal(props(result).limit.default, 20);
+    assert.equal(props(result).limit.minimum, 1);
+    assert.equal(props(result).limit.maximum, 100);
   });
 
-  test("enum", () => {
-    const result = zodFieldToJsonSchema(z.enum(["BTC", "USD"]));
-    assert.equal(result.type, "string");
-    assert.deepEqual(result.enum, ["BTC", "USD"]);
+  test("boolean, enum and array fields", () => {
+    const result = toolInputJsonSchema(
+      z.object({
+        flag: z.boolean(),
+        currency: z.enum(["BTC", "USD"]),
+        ids: z.array(z.string()),
+      }),
+    );
+    assert.equal(props(result).flag.type, "boolean");
+    assert.equal(props(result).currency.type, "string");
+    assert.deepEqual(props(result).currency.enum, ["BTC", "USD"]);
+    assert.equal(props(result).ids.type, "array");
+    assert.deepEqual(props(result).ids.items, { type: "string" });
   });
 
-  test("array of strings", () => {
-    const result = zodFieldToJsonSchema(z.array(z.string()));
-    assert.equal(result.type, "array");
-    assert.deepEqual(result.items, { type: "string" });
+  test("does not forbid additional properties (approval_code is injected)", () => {
+    const result = toolInputJsonSchema(z.object({ a: z.string() }));
+    assert.equal(result.additionalProperties, undefined);
   });
+});
 
-  test("optional unwraps inner type", () => {
-    assert.deepEqual(zodFieldToJsonSchema(z.string().optional()), {
-      type: "string",
+describe("every registered tool converts to an object schema", () => {
+  const allTools = {
+    ...walletTools,
+    ...lightningTools,
+    ...onchainTools,
+    ...intraledgerTools,
+    ...webhookTools,
+    ...l402Tools,
+  };
+
+  for (const [name, def] of Object.entries(allTools)) {
+    test(name, () => {
+      const result = toolInputJsonSchema(def.inputSchema);
+      assert.equal(result.type, "object");
+      assert.equal(typeof result.properties, "object");
+      const required = (result.required as string[] | undefined) ?? [];
+      for (const key of required) {
+        assert.ok(key in props(result), `${name}: required ${key} missing`);
+      }
     });
-  });
-
-  test("default includes default value", () => {
-    const result = zodFieldToJsonSchema(z.string().default("mainnet"));
-    assert.equal(result.type, "string");
-    assert.equal(result.default, "mainnet");
-  });
-
-  test("default with number", () => {
-    const result = zodFieldToJsonSchema(z.number().default(10));
-    assert.equal(result.type, "number");
-    assert.equal(result.default, 10);
-  });
-
-  test("unknown type falls back to {type: string}", () => {
-    // ZodNull is not handled — should fall through to default
-    const result = zodFieldToJsonSchema(z.null() as unknown as z.ZodType);
-    assert.deepEqual(result, { type: "string" });
-  });
+  }
 });

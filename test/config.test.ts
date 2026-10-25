@@ -21,7 +21,7 @@ import os from "node:os";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 
-// Helper: run a small inline TypeScript snippet in a child process
+// Helper: run a small inline JavaScript snippet in a child process
 // with the given env vars and return { exitCode, stderr, stdout }.
 function runConfig(
   env: Record<string, string | undefined>,
@@ -29,19 +29,20 @@ function runConfig(
 ): { exitCode: number; stderr: string; stdout: string } {
   // Write the snippet to a temp file so we avoid shell-quoting headaches
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "blink-mcp-cfg-"));
-  const tmpFile = path.join(tmpDir, "snippet.ts");
+  const tmpFile = path.join(tmpDir, "snippet.mjs");
 
   fs.writeFileSync(
     tmpFile,
     `
-// Inline getConfig from src/index.ts (copy, kept in sync)
+// Inline getConfig from src/index.ts (copy, kept in sync).
+// Plain JS so the child runs on node alone, without a TS loader.
 function getConfig() {
   const apiKey = process.env.BLINK_API_KEY;
   if (!apiKey) {
     console.error('Error: BLINK_API_KEY environment variable is required');
     process.exit(1);
   }
-  const network = (process.env.BLINK_NETWORK || 'mainnet') as 'mainnet' | 'staging';
+  const network = process.env.BLINK_NETWORK || 'mainnet';
   if (network !== 'mainnet' && network !== 'staging') {
     console.error('Error: BLINK_NETWORK must be "mainnet" or "staging"');
     process.exit(1);
@@ -53,7 +54,7 @@ ${snippet}
 `,
   );
 
-  const result = spawnSync(process.execPath, ["--import", "tsx/esm", tmpFile], {
+  const result = spawnSync(process.execPath, [tmpFile], {
     cwd: ROOT,
     env: { ...process.env, ...env },
     timeout: 10_000,

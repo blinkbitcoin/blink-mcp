@@ -17,7 +17,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 
 ## Prerequisites
 
-- Node.js 18+
+- Node.js 24+
 - A Blink wallet account ([dashboard.blink.sv](https://dashboard.blink.sv))
 - A Blink API key
 
