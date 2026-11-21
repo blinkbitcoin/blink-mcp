@@ -131,7 +131,7 @@ BLINK_API_KEY=your_key node dist/index.js
 | `get_invoice_status`               | Check invoice status by hash     |
 | `get_invoice_status_by_request`    | Check status by bolt11           |
 | `pay_invoice`                      | Pay a Lightning invoice          |
-| `pay_invoice_with_amount`          | Pay open invoice with amount     |
+| `pay_invoice_with_amount`          | Pay open invoice (BTC wallet)    |
 | `pay_lightning_address`            | Send to Lightning address        |
 | `pay_lnurl`                        | Pay via LNURL                    |
 | `estimate_lightning_fee`           | Estimate payment fee             |
