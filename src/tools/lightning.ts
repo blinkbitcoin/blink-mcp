@@ -69,11 +69,11 @@ export const lightningTools = {
   },
 
   pay_invoice_with_amount: {
-    description: 'Pay a Lightning invoice that has no amount specified (open invoice). You specify the amount to send.',
+    description: 'Pay a Lightning invoice that has no amount specified (open invoice) from a BTC wallet. You specify the amount to send, in satoshis. USD wallets are not supported.',
     inputSchema: z.object({
-      wallet_id: z.string().describe('The wallet ID to pay from'),
+      wallet_id: z.string().describe('The BTC wallet ID to pay from'),
       payment_request: z.string().describe('The bolt11 payment request to pay'),
-      amount: z.number().int().positive().describe('Amount in satoshis (BTC wallet) or cents (USD wallet)'),
+      amount: z.number().int().positive().describe('Amount in satoshis to send'),
       memo: z.string().optional().describe('Optional memo to attach to the payment'),
     }),
   },
@@ -286,8 +286,16 @@ export async function handleLightningTool(
         amount: number;
         memo?: string;
       };
-      // Determine if BTC or USD wallet based on amount context
-      // For now, we'll use the standard BTC no-amount payment
+      // The amount is sats and the spend guard caps it as sats, so only a
+      // BTC wallet may pay. Refuse a USD wallet before the backend does.
+      const walletResult = await client.getWalletById(wallet_id);
+      const wallet = walletResult.me.defaultAccount.walletById as { walletCurrency: string } | null;
+      if (wallet?.walletCurrency === 'USD') {
+        return {
+          success: false,
+          error: 'pay_invoice_with_amount only pays from a BTC wallet (amount is in satoshis). Pass a BTC wallet_id.',
+        };
+      }
       const result = await client.payLnNoAmountInvoice({
         walletId: wallet_id,
         paymentRequest: payment_request,
