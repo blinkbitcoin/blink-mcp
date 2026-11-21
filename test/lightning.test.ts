@@ -58,6 +58,21 @@ describe("pay_invoice_with_amount", () => {
     assert.deepEqual(calls, ["getWalletById"]);
   });
 
+  it("returns a failure without paying when the wallet lookup throws", async () => {
+    const { client, calls } = makeClient("BTC");
+    (client as unknown as { getWalletById: () => Promise<never> }).getWalletById = async () => {
+      calls.push("getWalletById");
+      throw new Error("network down");
+    };
+    const result = (await handleLightningTool(client, "pay_invoice_with_amount", args)) as {
+      success: boolean;
+      error: string;
+    };
+    assert.equal(result.success, false);
+    assert.match(result.error, /network down/);
+    assert.deepEqual(calls, ["getWalletById"]);
+  });
+
   it("describes the amount as satoshis only", () => {
     const schema = lightningTools.pay_invoice_with_amount.inputSchema;
     assert.doesNotMatch(schema.shape.amount.description ?? "", /cents|USD/);

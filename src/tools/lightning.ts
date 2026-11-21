@@ -105,9 +105,9 @@ export const lightningTools = {
   },
 
   estimate_lightning_fee_no_amount: {
-    description: 'Estimate the Lightning network fee for paying an open (no-amount) invoice',
+    description: 'Estimate the Lightning network fee for paying an open (no-amount) invoice from a BTC wallet',
     inputSchema: z.object({
-      wallet_id: z.string().describe('The wallet ID to pay from'),
+      wallet_id: z.string().describe('The BTC wallet ID to pay from'),
       payment_request: z.string().describe('The bolt11 payment request'),
       amount: z.number().int().positive().describe('The amount you want to send in satoshis'),
     }),
@@ -288,8 +288,18 @@ export async function handleLightningTool(
       };
       // The amount is sats and the spend guard caps it as sats, so only a
       // BTC wallet may pay. Refuse a USD wallet before the backend does.
-      const walletResult = await client.getWalletById(wallet_id);
-      const wallet = walletResult.me.defaultAccount.walletById as { walletCurrency: string } | null;
+      // A failed lookup returns instead of throwing: nothing was sent, and a
+      // throw would leave the guard's spend reservation pending.
+      let wallet: { walletCurrency: string } | null;
+      try {
+        const walletResult = await client.getWalletById(wallet_id);
+        wallet = walletResult.me.defaultAccount.walletById as { walletCurrency: string } | null;
+      } catch (error) {
+        return {
+          success: false,
+          error: `Could not look up wallet ${wallet_id}: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
       if (wallet?.walletCurrency === 'USD') {
         return {
           success: false,
